@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+websockets
+sqlalchemy
+requests
+PyJWT
+celery
+kombu
+redis
