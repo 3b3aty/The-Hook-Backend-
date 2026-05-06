@@ -13,6 +13,7 @@ from email.utils import parseaddr, parsedate_to_datetime
 from email.message import EmailMessage
 from typing import Any, Dict, List, Optional
 import requests
+from urllib.parse import urlencode
 import jwt
 from redis.asyncio import Redis
 
@@ -747,19 +748,22 @@ def callback(code: str, db: Session = Depends(get_db)):
     if expires_in < 0:
         expires_in = 0
 
-    return {
+    payload = {
         "jwt_token": tokens["access_token"],
         "refresh_token": tokens["refresh_token"],
         "expires_in": expires_in,
-        "user": {
-            "user_id": str(user.id),
-            "google_id": user.google_user_id,
-            "name": user.name,
-            "email": user.email,
-            "photo_url": user.profile_picture,
-            "provider": "google",
-        },
+        "user_id": str(user.id),
+        "google_id": user.google_user_id or "",
+        "name": user.name or "",
+        "email": user.email,
+        "photo_url": user.profile_picture or "",
+        "provider": "google",
     }
+
+    # Redirect to the mobile app deep link with the JSON data as query params.
+    query = urlencode(payload)
+    deep_link = f"phishingdetectorapp://auth/callback?{query}"
+    return RedirectResponse(deep_link)
 
 
 @app.post("/auth/logout-and-reauth")
