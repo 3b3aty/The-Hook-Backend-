@@ -21,6 +21,8 @@ import models
 from message_queue.producer import enqueue_email_analysis
 from websocket.manager import manager
 from redis_pubsub import REDIS_URL, REDIS_CHANNEL
+from dotenv import load_dotenv
+load_dotenv()
 
 models.Base.metadata.create_all(bind=engine)
 

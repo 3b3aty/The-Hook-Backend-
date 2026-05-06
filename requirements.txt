@@ -7,3 +7,4 @@ PyJWT
 celery
 kombu
 redis
+dotenv
