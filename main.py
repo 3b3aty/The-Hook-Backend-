@@ -353,6 +353,34 @@ def _serialize_email(email: models.Email) -> Dict[str, Any]:
     }
 
 
+def _serialize_sender(sender: Optional[models.User]) -> Optional[Dict[str, Any]]:
+    if not sender:
+        return None
+    return {
+        "user_id": sender.id,
+        "email": sender.email,
+        "name": sender.name,
+        "photo_url": sender.profile_picture,
+        "provider": sender.provider,
+    }
+
+
+def _get_sender_for_email(db: Session, email_id: int, receiver_id: int) -> Optional[models.User]:
+    return (
+        db.query(models.User)
+        .join(models.Interface, models.Interface.sender_id == models.User.id)
+        .filter(models.Interface.email_id == email_id, models.Interface.receiver_id == receiver_id)
+        .first()
+    )
+
+
+def _serialize_email_for_user(db: Session, email: models.Email, receiver_id: int) -> Dict[str, Any]:
+    payload = _serialize_email(email)
+    sender = _get_sender_for_email(db, email.id, receiver_id)
+    payload["sender"] = _serialize_sender(sender)
+    return payload
+
+
 def _normalize_reasons(value: Any) -> List[str]:
     if value is None:
         return []
@@ -444,12 +472,12 @@ def _collect_analysis_results(db: Session, email_id: int) -> Dict[str, Any]:
     }
 
 
-def _send_email_received(user_id: int, email: models.Email) -> None:
+def _send_email_received(db: Session, user_id: int, email: models.Email) -> None:
     manager.send_json_sync(
         user_id,
         {
             "type": "email_received",
-            "email": _serialize_email(email),
+            "email": _serialize_email_for_user(db, email, user_id),
         },
     )
 
@@ -631,7 +659,7 @@ def _fetch_and_store_emails_for_user(
 
         enqueue_email_analysis(email_id)
         if send_each_email and notify_user_id is not None:
-            _send_email_received(notify_user_id, email_record)
+            _send_email_received(db, notify_user_id, email_record)
         stored += 1
 
     user.last_email_sync = datetime.now(timezone.utc)
@@ -931,7 +959,8 @@ async def _send_initial_batch(user_id: int, max_results: int = 20) -> None:
                 return {"emails": [], "should_fetch": False}
 
             emails = _load_user_emails(db, user_id, max_results)
-            return {"emails": [_serialize_email(email) for email in emails], "should_fetch": len(emails) == 0}
+            serialized = [_serialize_email_for_user(db, email, user_id) for email in emails]
+            return {"emails": serialized, "should_fetch": len(emails) == 0}
         finally:
             db.close()
 

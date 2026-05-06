@@ -32,20 +32,9 @@ def analyze_urls(email_id: int) -> dict:
             db.commit()
 
             user_id = get_receiver_user_id(db, email_id)
-            if user_id:
-                publish_event(
-                    {
-                        "user_id": user_id,
-                        "type": "partial_update",
-                        "email_id": email_id,
-                        "field": "urls",
-                        "status": email.urls_status,
-                        "urls": [],
-                    }
-                )
-                if final_payload:
-                    final_payload["user_id"] = user_id
-                    publish_event(final_payload)
+            if user_id and final_payload:
+                final_payload["user_id"] = user_id
+                publish_event(final_payload)
             return {"status": "no_urls"}
 
         result = analyze_urls_api(email, url_list)

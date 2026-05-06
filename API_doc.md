@@ -449,7 +449,14 @@ Receive initial email batch and real-time new email notifications.
       "is_read": false,
       "is_hooked": false,
       "is_trash": false,
-      "is_starred": false
+      "is_starred": false,
+      "sender": {
+        "user_id": 7,
+        "email": "sender@example.com",
+        "name": "Sender Name",
+        "photo_url": null,
+        "provider": "external"
+      }
     }
   ]
 }
@@ -478,7 +485,14 @@ Receive initial email batch and real-time new email notifications.
     "is_read": false,
     "is_hooked": false,
     "is_trash": false,
-    "is_starred": false
+    "is_starred": false,
+    "sender": {
+      "user_id": 7,
+      "email": "sender@example.com",
+      "name": "Sender Name",
+      "photo_url": null,
+      "provider": "external"
+    }
   }
 }
 ```
