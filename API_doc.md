@@ -15,6 +15,7 @@ After OAuth login, you receive:
 - Protected HTTP endpoints use only the `Authorization: Bearer <jwt_token>` header.
 - WebSocket endpoints use the JWT in the query string, for example `?token=<jwt_token>`.
 - Do not send both a query token and an Authorization header for the same HTTP request.
+- In Swagger UI, use the **Authorize** button (top-right) to set the bearer token once.
 
 
 

@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException, Header, WebSocket, WebSocketDisconnect, Body
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Body
 from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
 import asyncio
 import base64
@@ -27,6 +28,7 @@ load_dotenv()
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 async def _redis_listener() -> None:
@@ -227,6 +229,15 @@ def _get_current_user(token: str, db: Session) -> models.User:
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user
+
+
+def get_current_user_from_auth(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> models.User:
+    if not credentials or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Missing JWT token")
+    return _get_current_user(credentials.credentials, db)
 
 
 def _refresh_google_access_token(user: models.User, db: Session) -> str:
@@ -725,13 +736,9 @@ def callback(code: str, db: Session = Depends(get_db)):
 
 @app.post("/auth/logout-and-reauth")
 def logout_and_reauth(
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    user: models.User = Depends(get_current_user_from_auth),
     db: Session = Depends(get_db),
 ):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing JWT token")
-
-    user = _get_current_user(authorization, db)
     user.access_token = None
     user.refresh_token = None
     user.token_expiry = None
@@ -748,14 +755,9 @@ def send_email(
     recipients: List[str] = Body(...),
     subject: Optional[str] = Body(None),
     body: Optional[str] = Body(None),
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    user: models.User = Depends(get_current_user_from_auth),
     db: Session = Depends(get_db),
 ):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing JWT token")
-
-    user = _get_current_user(authorization, db)
-
     if not recipients or not isinstance(recipients, list):
         raise HTTPException(status_code=400, detail="recipients must be a non-empty list of email addresses")
 
@@ -858,13 +860,9 @@ def send_email(
 @app.patch("/emails/{email_id}/read")
 def mark_email_read(
     email_id: int,
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    user: models.User = Depends(get_current_user_from_auth),
     db: Session = Depends(get_db),
 ):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing JWT token")
-
-    user = _get_current_user(authorization, db)
     email = (
         db.query(models.Email)
         .join(models.Interface, models.Interface.email_id == models.Email.id)
@@ -884,13 +882,9 @@ def mark_email_read(
 def mark_email_trash(
     email_id: int,
     value: bool = True,
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    user: models.User = Depends(get_current_user_from_auth),
     db: Session = Depends(get_db),
 ):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing JWT token")
-
-    user = _get_current_user(authorization, db)
     email = (
         db.query(models.Email)
         .join(models.Interface, models.Interface.email_id == models.Email.id)
@@ -910,13 +904,9 @@ def mark_email_trash(
 def mark_email_starred(
     email_id: int,
     value: bool = True,
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    user: models.User = Depends(get_current_user_from_auth),
     db: Session = Depends(get_db),
 ):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing JWT token")
-
-    user = _get_current_user(authorization, db)
     email = (
         db.query(models.Email)
         .join(models.Interface, models.Interface.email_id == models.Email.id)
