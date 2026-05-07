@@ -31,6 +31,11 @@ app = FastAPI()
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
+@app.get("/health")
+async def health_check() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
 async def _redis_listener() -> None:
     redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
     pubsub = redis_client.pubsub()

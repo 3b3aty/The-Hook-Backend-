@@ -1,0 +1,50 @@
+# Git
+.git
+.gitignore
+
+# Docker
+.dockerignore
+Dockerfile
+docker-compose.yml
+k8s-manifest.yaml
+
+# Security / Environment Variables
+.env
+.env.*
+*.pem
+secrets/
+
+# Python caching and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+env/
+venv/
+.venv/
+.Python
+
+# Testing and Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Local databases (prevents baking your local SQLite DB into the container)
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build and distribution directories
+build/
+dist/
+*.egg-info/
