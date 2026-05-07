@@ -77,6 +77,8 @@ REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 
+ATTACHMENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attachments_store")
+
 
 def get_db():
     db = SessionLocal()
@@ -429,6 +431,7 @@ def _serialize_headers(row: Optional[models.EmailHeaders]) -> Optional[Dict[str,
         return None
     return {
         "verdict": row.verdict,
+        "score": row.score,
         "reasons": _normalize_reasons(row.reasons),
         "status": row.status,
     }
@@ -638,11 +641,19 @@ def _fetch_and_store_emails_for_user(
             )
             attachment_payload = _gmail_get_json(user, db, attachment_url)
             attachment_data = attachment_payload.get("data")
+            file_path = None
             if attachment_data:
                 blob = _decode_base64_url_bytes(attachment_data)
                 attachment_hash = hashlib.sha256(blob).hexdigest()
                 if attachment_size is None:
                     attachment_size = len(blob)
+
+                # Save attachment bytes to disk for later analysis
+                email_att_dir = os.path.join(ATTACHMENTS_DIR, str(email_record.id))
+                os.makedirs(email_att_dir, exist_ok=True)
+                file_path = os.path.join(email_att_dir, attachment.get("filename", "unknown"))
+                with open(file_path, "wb") as f:
+                    f.write(blob)
 
             db.add(
                 models.Attachments(
@@ -651,6 +662,7 @@ def _fetch_and_store_emails_for_user(
                     file_type=attachment.get("mime_type"),
                     file_size=attachment_size,
                     hash_sha256=attachment_hash,
+                    file_url=file_path,
                     status="PENDING",
                 )
             )
