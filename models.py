@@ -135,6 +135,7 @@ class EmailHeaders(Base):
     return_path = Column(String, nullable=True)
     reasons = Column(JSON, nullable=True)
     verdict = Column(String, nullable=True)
+    score = Column(Float, nullable=True)
 
     raw_headers = Column(Text, nullable=True)
 

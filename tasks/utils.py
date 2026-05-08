@@ -64,6 +64,7 @@ def serialize_headers(row: Optional[models.EmailHeaders]) -> Optional[Dict[str, 
         return None
     return {
         "verdict": row.verdict,
+        "score": row.score,
         "reasons": normalize_reasons(row.reasons),
         "status": row.status,
     }

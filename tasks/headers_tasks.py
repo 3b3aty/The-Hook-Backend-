@@ -37,6 +37,7 @@ def analyze_headers(email_id: int) -> dict:
 
         headers_row.verdict = result.get("verdict")
         headers_row.reasons = normalize_reasons(result.get("reasons"))
+        headers_row.score = result.get("score")
         headers_row.status = "DONE"
         headers_row.analyzed_at = now
 

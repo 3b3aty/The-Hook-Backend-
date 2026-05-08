@@ -13,6 +13,7 @@ from email.utils import parseaddr, parsedate_to_datetime
 from email.message import EmailMessage
 from typing import Any, Dict, List, Optional
 import requests
+from urllib.parse import urlencode
 import jwt
 from redis.asyncio import Redis
 
@@ -80,6 +81,8 @@ CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "")
+
+ATTACHMENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attachments_store")
 
 
 def get_db():
@@ -433,6 +436,7 @@ def _serialize_headers(row: Optional[models.EmailHeaders]) -> Optional[Dict[str,
         return None
     return {
         "verdict": row.verdict,
+        "score": row.score,
         "reasons": _normalize_reasons(row.reasons),
         "status": row.status,
     }
@@ -642,11 +646,19 @@ def _fetch_and_store_emails_for_user(
             )
             attachment_payload = _gmail_get_json(user, db, attachment_url)
             attachment_data = attachment_payload.get("data")
+            file_path = None
             if attachment_data:
                 blob = _decode_base64_url_bytes(attachment_data)
                 attachment_hash = hashlib.sha256(blob).hexdigest()
                 if attachment_size is None:
                     attachment_size = len(blob)
+
+                # Save attachment bytes to disk for later analysis
+                email_att_dir = os.path.join(ATTACHMENTS_DIR, str(email_record.id))
+                os.makedirs(email_att_dir, exist_ok=True)
+                file_path = os.path.join(email_att_dir, attachment.get("filename", "unknown"))
+                with open(file_path, "wb") as f:
+                    f.write(blob)
 
             db.add(
                 models.Attachments(
@@ -655,6 +667,7 @@ def _fetch_and_store_emails_for_user(
                     file_type=attachment.get("mime_type"),
                     file_size=attachment_size,
                     hash_sha256=attachment_hash,
+                    file_url=file_path,
                     status="PENDING",
                 )
             )
@@ -752,19 +765,22 @@ def callback(code: str, db: Session = Depends(get_db)):
     if expires_in < 0:
         expires_in = 0
 
-    return {
+    payload = {
         "jwt_token": tokens["access_token"],
         "refresh_token": tokens["refresh_token"],
         "expires_in": expires_in,
-        "user": {
-            "user_id": str(user.id),
-            "google_id": user.google_user_id,
-            "name": user.name,
-            "email": user.email,
-            "photo_url": user.profile_picture,
-            "provider": "google",
-        },
+        "user_id": str(user.id),
+        "google_id": user.google_user_id or "",
+        "name": user.name or "",
+        "email": user.email,
+        "photo_url": user.profile_picture or "",
+        "provider": "google",
     }
+
+    # Redirect to the mobile app deep link with the JSON data as query params.
+    query = urlencode(payload)
+    deep_link = f"phishingdetectorapp://auth/callback?{query}"
+    return RedirectResponse(deep_link)
 
 
 @app.post("/auth/logout-and-reauth")
