@@ -505,7 +505,7 @@ def _get_or_create_category(db: Session, name: str) -> models.Category:
     return category
 
 
-def _load_user_emails(db: Session, user_id: int, limit: int = 20) -> List[models.Email]:
+def _load_user_emails(db: Session, user_id: int, limit: int = 60) -> List[models.Email]:
     return (
         db.query(models.Email)
         .join(models.Interface, models.Interface.email_id == models.Email.id)
@@ -559,7 +559,12 @@ def _fetch_and_store_emails_for_user(
             (header.get("value") for header in headers if header.get("name", "").lower() == "from"),
             "",
         )
+        to_header = next(
+            (header.get("value") for header in headers if header.get("name", "").lower() == "to"),
+            "",
+        )
         sender_name, sender_email = parseaddr(from_header)
+        receiver_name, receiver_email = parseaddr(to_header)
 
         email_date = _parse_email_date(headers, message.get("internalDate"))
         body_full = extract_body(payload)
@@ -587,21 +592,26 @@ def _fetch_and_store_emails_for_user(
         db.add(email_record)
         db.flush()
 
-        sender_user = None
-        if sender_email:
-            sender_user = db.query(models.User).filter(models.User.email == sender_email).first()
-            if not sender_user:
-                sender_user = models.User(
-                    email=sender_email,
-                    name=sender_name or None,
+        def _get_or_create_external_user(email_addr: str, display_name: str) -> Optional[models.User]:
+            if not email_addr:
+                return None
+            found = db.query(models.User).filter(models.User.email == email_addr).first()
+            if not found:
+                found = models.User(
+                    email=email_addr,
+                    name=display_name or None,
                     provider="external",
                 )
-                db.add(sender_user)
+                db.add(found)
                 db.flush()
+            return found
+
+        sender_user = _get_or_create_external_user(sender_email, sender_name)
+        receiver_user = _get_or_create_external_user(receiver_email, receiver_name)
 
         interface_record = models.Interface(
             sender_id=sender_user.id if sender_user else None,
-            receiver_id=user.id,
+            receiver_id=receiver_user.id if receiver_user else None,
             email_id=email_record.id,
         )
         db.add(interface_record)
@@ -966,7 +976,7 @@ def mark_email_starred(
     return {"email_id": email_id, "is_starred": email.is_starred}
 
 
-async def _send_initial_batch(user_id: int, max_results: int = 20) -> None:
+async def _send_initial_batch(user_id: int, max_results: int = 60) -> None:
     def _load_existing() -> Dict[str, Any]:
         db = SessionLocal()
         try:
@@ -987,7 +997,7 @@ async def _send_initial_batch(user_id: int, max_results: int = 20) -> None:
         asyncio.create_task(_stream_gmail_emails(user_id, max_results))
 
 
-async def _stream_gmail_emails(user_id: int, max_results: int = 20) -> None:
+async def _stream_gmail_emails(user_id: int, max_results: int = 60) -> None:
     def _sync() -> None:
         db = SessionLocal()
         try:
