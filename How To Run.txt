@@ -1,0 +1,4 @@
+ngrok http 8000
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+celery -A celery_app.celery_app worker -Q url_queue,body_queue,headers_queue,attachments_queue --loglevel=info --pool=solo --concurrency=1 --without-mingle --without-gossip
+

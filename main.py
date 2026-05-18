@@ -6,6 +6,7 @@ import asyncio
 import base64
 from contextlib import suppress
 import hashlib
+import html
 import json
 import re
 from datetime import datetime, timezone, timedelta
@@ -118,10 +119,10 @@ def extract_body(payload: Dict[str, Any]) -> str:
 
     walk(payload)
 
-    if plain_parts:
-        return "\n".join(plain_parts)
     if html_parts:
         return "\n".join(html_parts)
+    if plain_parts:
+        return "\n".join(plain_parts)
 
     fallback = payload.get("body", {}).get("data")
     return _decode_base64_url(fallback) if fallback else ""
@@ -331,8 +332,24 @@ def _collect_attachments(payload: Dict[str, Any], out: List[Dict[str, Any]]) -> 
         _collect_attachments(part, out)
 
 
+def clean_email_body(raw: str) -> str:
+    if not raw:
+        return ""
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p\s*>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
+
+
 def _serialize_email(email: models.Email) -> Dict[str, Any]:
     category_name = email.category.name if email.category else None
+    body_full = email.body_full or ""
+    body_clean = clean_email_body(body_full)
+    date_epoch_ms = int(email.date.timestamp() * 1000) if email.date else None
     return {
         "email_id": email.id,
         "gmail_message_id": email.gmail_message_id,
@@ -340,8 +357,10 @@ def _serialize_email(email: models.Email) -> Dict[str, Any]:
         "subject": email.subject,
         "snippet": email.body_snippet,
         "body": email.body_full,
+        "body_clean": body_clean,
         "category": category_name,
         "date": email.date.isoformat() if email.date else None,
+        "date_epoch_ms": date_epoch_ms,
         "status": email.status,
         "risk_score": email.risk_score,
         "final_verdict": email.final_verdict,
@@ -1073,6 +1092,4 @@ async def websocket_updates(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(user_id_int)
-
-
 
