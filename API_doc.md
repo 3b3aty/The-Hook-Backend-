@@ -1,12 +1,11 @@
 # Email Security Backend - API Documentation
 
-
-
 ## Authentication
 
 ### JWT Tokens
 
 After OAuth login, you receive:
+
 - `jwt_token` (access token, valid 15 minutes)
 - `refresh_token` (valid 7 days)
 
@@ -16,8 +15,6 @@ After OAuth login, you receive:
 - WebSocket endpoints use the JWT in the query string, for example `?token=<jwt_token>`.
 - Do not send both a query token and an Authorization header for the same HTTP request.
 - In Swagger UI, use the **Authorize** button (top-right) to set the bearer token once.
-
-
 
 ## Email Endpoints
 
@@ -35,15 +32,18 @@ Initiate Google OAuth login flow.
 **Query Parameters:** None
 
 **Response:**
+
 - Redirects to Google consent screen.
 - After user approves, Google redirects to `/auth/google/callback`.
 
 **Example Request:**
+
 ```
 GET http://127.0.0.1:8000/auth/google/login
 ```
 
 **Scopes Requested:**
+
 - `openid email profile`
 - `https://www.googleapis.com/auth/gmail.readonly` (read emails)
 - `https://www.googleapis.com/auth/gmail.send` (send emails)
@@ -62,9 +62,11 @@ Google OAuth callback. Exchanges authorization code for tokens. Returns JWT.
 **URL:** `/auth/google/callback?code=...`
 
 **Query Parameters:**
+
 - `code` (required): Authorization code from Google
 
 **Response JSON:**
+
 ```json
 {
   "jwt_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
@@ -82,15 +84,20 @@ Google OAuth callback. Exchanges authorization code for tokens. Returns JWT.
 ```
 
 **Status Codes:**
+
 - `200` OK - successful login
 - `502` Bad Gateway - Google API error
 
 **Example Request:**
+
 ```
 GET http://127.0.0.1:8000/auth/google/callback?code=4/0AX4XfWgZq...
 ```
+
 ---
+
 ## Important Note:
+
 front end call the login endpoint and the endpoint callback is called internal not by the front end and he get the information about the login
 
 ---
@@ -107,6 +114,7 @@ Clear Google tokens and force re-authorization (useful when fixing scope issues)
 **URL:** `/auth/logout-and-reauth`
 
 **Request Headers:**
+
 ```
 Authorization: Bearer <jwt_token>
 Content-Type: application/json
@@ -115,6 +123,7 @@ Content-Type: application/json
 **Request Body:** Empty or `{}`
 
 **Response JSON:**
+
 ```json
 {
   "message": "Tokens cleared. Please go to /auth/google/login to re-authorize with the new permissions.",
@@ -123,10 +132,12 @@ Content-Type: application/json
 ```
 
 **Status Codes:**
+
 - `200` OK
 - `401` Unauthorized - missing/invalid JWT
 
 **Example Request:**
+
 ```bash
 curl -X POST http://127.0.0.1:8000/auth/logout-and-reauth \
   -H "Authorization: Bearer eyJhbGc..." \
@@ -135,7 +146,103 @@ curl -X POST http://127.0.0.1:8000/auth/logout-and-reauth \
 
 ---
 
-### 4. POST /emails/send
+### 4. POST /labels
+
+**Purpose:**  
+Create a label for the authenticated user.
+
+**Auth Required:** Yes (JWT)
+
+**HTTP Method:** POST
+
+**URL:** `/labels`
+
+**Request Body (JSON):**
+
+```json
+{
+  "name": "Important",
+  "color": "#ff9900"
+}
+```
+
+**Body Parameters:**
+
+- `name` (required, string): Label name
+- `color` (optional, string): Label color value
+
+**Response JSON (Success):**
+
+```json
+{
+  "label_id": 12,
+  "name": "Important",
+  "color": "#ff9900",
+  "created_at": "2026-06-24T10:00:00+00:00"
+}
+```
+
+**Status Codes:**
+
+- `200` OK
+- `400` Bad Request - missing or empty label name
+- `401` Unauthorized
+
+---
+
+### 5. POST /label-rules
+
+**Purpose:**  
+Add a user to a specific label by creating a row in the `label_rules` table and backfilling matching emails into `email_labels`.
+
+**Auth Required:** Yes (JWT)
+
+**HTTP Method:** POST
+
+**URL:** `/label-rules`
+
+**Request Body (JSON):**
+
+```json
+{
+  "label_id": 12,
+  "from_user_id": 7
+}
+```
+
+**Body Parameters:**
+
+- `label_id` (required, integer): The authenticated user's label id
+- `from_user_id` (required, integer): The user id to add to the label
+
+**Behavior:**
+
+- Adds a `label_rules` row for the authenticated user.
+- Finds all existing emails received by the current user from `from_user_id` and creates matching rows in `email_labels`.
+- Reusing the same rule is idempotent and only backfills missing `email_labels` rows.
+
+**Response JSON (Success):**
+
+```json
+{
+  "rule_id": 3,
+  "label_id": 12,
+  "from_user_id": 7,
+  "created": true,
+  "tagged_emails_count": 42
+}
+```
+
+**Status Codes:**
+
+- `200` OK
+- `400` Bad Request - invalid ids
+- `401` Unauthorized
+- `404` Not Found - label or user not found
+
+---
+
+### 6. POST /emails/send
 
 **Purpose:**  
 Send an email via Gmail to one or more recipients. Stores email in backend.
@@ -147,29 +254,30 @@ Send an email via Gmail to one or more recipients. Stores email in backend.
 **URL:** `/emails/send`
 
 **Request Headers:**
+
 ```
 Authorization: Bearer <jwt_token>
 Content-Type: application/json
 ```
 
 **Request Body (JSON):**
+
 ```json
 {
-  "recipients": [
-    "alice@example.com",
-    "bob@example.com"
-  ],
+  "recipients": ["alice@example.com", "bob@example.com"],
   "subject": "Test Email",
   "body": "Hello team, this is a test message."
 }
 ```
 
 **Body Parameters:**
+
 - `recipients` (required, array of strings): Email addresses of recipients
 - `subject` (optional, string): Email subject line
 - `body` (optional, string): Email body/message content
 
 **Response JSON (Success):**
+
 ```json
 {
   "email_id": 15,
@@ -178,10 +286,8 @@ Content-Type: application/json
 }
 ```
 
-
-
-
 **Status Codes:**
+
 - `200` OK - email sent successfully
 - `400` Bad Request - invalid recipients or malformed body
 - `401` Unauthorized - missing/invalid JWT
@@ -190,6 +296,7 @@ Content-Type: application/json
 **Error Responses:**
 
 1. Missing JWT:
+
 ```json
 {
   "detail": "Missing JWT token"
@@ -197,6 +304,7 @@ Content-Type: application/json
 ```
 
 2. Invalid recipients:
+
 ```json
 {
   "detail": "recipients must be a non-empty list of email addresses"
@@ -204,16 +312,48 @@ Content-Type: application/json
 ```
 
 3. Insufficient Gmail scopes (before fix):
+
 ```json
 {
   "detail": "Failed to send email: {...} | RESOLUTION: Visit https://myaccount.google.com/permissions, revoke this app, then re-login via /auth/google/login"
 }
 ```
 
+---
+
+### 7. GET /emails
+
+**Purpose:**  
+List the authenticated user's emails with optional filters for delivery status, label, and sender.
+
+**Auth Required:** Yes (JWT)
+
+**HTTP Method:** GET
+
+**URL:** `/emails`
+
+**Query Parameters:**
+
+- `status` (optional, string): `draft`, `sent`, or `all` (default: `all`)
+- `label_id` (optional, integer): Filter emails tagged with this label
+- `from_user_id` (optional, integer): Filter emails sent by this user
+
+**Response JSON (Success):**
+
+```json
+{
+  "emails": [
+    {
+      "email_id": 1,
+      "subject": "Meeting Notes"
+    }
+  ]
+}
+```
 
 ---
 
-### 5. PATCH /emails/{email_id}/read
+### 8. PATCH /emails/{email_id}/read
 
 **Purpose:**  
 Mark an email as read.
@@ -225,9 +365,11 @@ Mark an email as read.
 **URL:** `/emails/{email_id}/read`
 
 **Path Parameters:**
+
 - `email_id` (required, integer): The database ID of the email
 
 **Request Headers:**
+
 ```
 Authorization: Bearer <jwt_token>
 Content-Type: application/json
@@ -236,6 +378,7 @@ Content-Type: application/json
 **Request Body:** Empty or `{}`
 
 **Response JSON:**
+
 ```json
 {
   "email_id": 5,
@@ -244,14 +387,14 @@ Content-Type: application/json
 ```
 
 **Status Codes:**
+
 - `200` OK
 - `401` Unauthorized - missing/invalid JWT
 - `404` Not Found - email not found or not accessible by user
 
-
 ---
 
-### 6. PATCH /emails/{email_id}/trash
+### 9. PATCH /emails/{email_id}/trash
 
 **Purpose:**  
 Set or clear the trash flag on an email.
@@ -263,12 +406,15 @@ Set or clear the trash flag on an email.
 **URL:** `/emails/{email_id}/trash`
 
 **Path Parameters:**
+
 - `email_id` (required, integer): The database ID of the email
 
 **Query Parameters:**
+
 - `value` (optional, boolean): `true` to mark as trash, `false` to untrash (default: `true`)
 
 **Request Headers:**
+
 ```
 Authorization: Bearer <jwt_token>
 Content-Type: application/json
@@ -277,6 +423,7 @@ Content-Type: application/json
 **Request Body:** Empty or `{}`
 
 **Response JSON (Trash):**
+
 ```json
 {
   "email_id": 5,
@@ -285,6 +432,7 @@ Content-Type: application/json
 ```
 
 **Response JSON (Untrash):**
+
 ```json
 {
   "email_id": 5,
@@ -293,15 +441,14 @@ Content-Type: application/json
 ```
 
 **Status Codes:**
+
 - `200` OK
 - `401` Unauthorized
 - `404` Not Found
 
-
-
 ---
 
-### 7. PATCH /emails/{email_id}/star
+### 10. PATCH /emails/{email_id}/star
 
 **Purpose:**  
 Set or clear the starred flag on an email.
@@ -313,12 +460,15 @@ Set or clear the starred flag on an email.
 **URL:** `/emails/{email_id}/star`
 
 **Path Parameters:**
+
 - `email_id` (required, integer): The database ID of the email
 
 **Query Parameters:**
+
 - `value` (optional, boolean): `true` to star, `false` to unstar (default: `true`)
 
 **Request Headers:**
+
 ```
 Authorization: Bearer <jwt_token>
 Content-Type: application/json
@@ -327,6 +477,7 @@ Content-Type: application/json
 **Request Body:** Empty or `{}`
 
 **Response JSON (Star):**
+
 ```json
 {
   "email_id": 5,
@@ -335,6 +486,7 @@ Content-Type: application/json
 ```
 
 **Response JSON (Unstar):**
+
 ```json
 {
   "email_id": 5,
@@ -343,11 +495,125 @@ Content-Type: application/json
 ```
 
 **Status Codes:**
+
 - `200` OK
 - `401` Unauthorized
 - `404` Not Found
 
+---
 
+### 11. PATCH /emails/{email_id}/draft_edit
+
+**Purpose:**  
+Edit an existing draft email owned by the authenticated user.
+
+**Auth Required:** Yes (JWT)
+
+**HTTP Method:** PATCH
+
+**URL:** `/emails/{email_id}/draft_edit`
+
+**Path Parameters:**
+
+- `email_id` (required, integer): The database ID of the draft email
+
+**Request Body:**
+
+Use `application/json` for text-only edits, or `multipart/form-data` when adding attachment files.
+
+**JSON Example:**
+
+```json
+{
+  "subject": "Updated draft subject",
+  "body": "Updated draft body",
+  "recipients": ["alice@example.com", "bob@example.com"],
+  "delete_attachment_ids": [12, 15]
+}
+```
+
+**Body Parameters:**
+
+- `subject` (optional, string): New draft subject
+- `body` (optional, string): New draft body
+- `recipients` (optional, array of strings): New recipient list
+- `delete_attachment_ids` (optional, array of integers): Attachment ids to remove from the draft
+- `files` (optional, uploaded files): Attachment files to add when using multipart/form-data
+
+**Multipart Form Fields:**
+
+- `subject` (optional, string)
+- `body` (optional, string)
+- `recipients` (optional, repeated string field or JSON array string)
+- `delete_attachment_ids` (optional, repeated integer field or JSON array string)
+- `files` (optional, one or more uploaded files)
+
+**Response JSON (Success):**
+
+```json
+{
+  "email_id": 5,
+  "status": "draft",
+  "delivery_status": "draft",
+  "subject": "Updated draft subject",
+  "body": "Updated draft body",
+  "recipients": ["alice@example.com", "bob@example.com"],
+  "attachments": []
+}
+```
+
+**Status Codes:**
+
+- `200` OK
+- `400` Bad Request - only draft emails can be edited or recipients are invalid
+- `401` Unauthorized
+- `404` Not Found
+
+---
+
+### 12. DELETE /emails/{email_id}
+
+**Purpose:**  
+Delete an email from the database and remove it from Gmail when it exists there.
+
+**Auth Required:** Yes (JWT)
+
+**HTTP Method:** DELETE
+
+**URL:** `/emails/{email_id}`
+
+**Path Parameters:**
+
+- `email_id` (required, integer): The database ID of the email
+
+**Request Headers:**
+
+```
+Authorization: Bearer <jwt_token>
+Content-Type: application/json
+```
+
+**Response JSON (Success):**
+
+```json
+{
+  "email_id": 5,
+  "deleted": true,
+  "gmail_deleted": true
+}
+```
+
+**Notes:**
+
+- If the email has a `gmail_message_id`, the backend deletes the Gmail message first and then removes the local database row plus related records.
+- Gmail deletion requires `gmail.modify` authorization. If the user has not reauthorized since this scope was added, the API returns a `502` with a re-login hint.
+
+**Status Codes:**
+
+- `200` OK
+- `401` Unauthorized
+- `404` Not Found
+- `502` Bad Gateway - Gmail API error or insufficient permissions
 
 ---
 
@@ -355,17 +621,18 @@ Content-Type: application/json
 
 ### HTTP Status Codes
 
-| Status | Meaning |
-|--------|---------|
-| 200 | OK - Request succeeded |
-| 400 | Bad Request - Invalid parameters |
-| 401 | Unauthorized - Missing or invalid JWT |
-| 404 | Not Found - Resource doesn't exist |
-| 502 | Bad Gateway - Upstream service error (Gmail API) |
+| Status | Meaning                                          |
+| ------ | ------------------------------------------------ |
+| 200    | OK - Request succeeded                           |
+| 400    | Bad Request - Invalid parameters                 |
+| 401    | Unauthorized - Missing or invalid JWT            |
+| 404    | Not Found - Resource doesn't exist               |
+| 502    | Bad Gateway - Upstream service error (Gmail API) |
 
 ### Error Response Format
 
 All errors follow this JSON structure:
+
 ```json
 {
   "detail": "Human-readable error message"
@@ -375,6 +642,7 @@ All errors follow this JSON structure:
 ### Common Errors
 
 **401 - Missing JWT Token**
+
 ```json
 {
   "detail": "Missing JWT token"
@@ -382,6 +650,7 @@ All errors follow this JSON structure:
 ```
 
 **401 - Invalid/Expired JWT**
+
 ```json
 {
   "detail": "Invalid JWT token"
@@ -389,6 +658,7 @@ All errors follow this JSON structure:
 ```
 
 **401 - JWT Expired**
+
 ```json
 {
   "detail": "JWT token expired"
@@ -396,6 +666,7 @@ All errors follow this JSON structure:
 ```
 
 **404 - Email Not Found**
+
 ```json
 {
   "detail": "Email not found"
@@ -403,6 +674,7 @@ All errors follow this JSON structure:
 ```
 
 **400 - Invalid Recipients**
+
 ```json
 {
   "detail": "recipients must be a non-empty list of email addresses"
@@ -422,10 +694,10 @@ Receive initial email batch and real-time new email notifications.
 
 **WebSocket URL:** `ws://127.0.0.1:8000/ws/emails?token=<jwt_token>`
 
-
 **Server Messages:**
 
 1. **initial_emails** (sent on connect):
+
 ```json
 {
   "type": "initial_emails",
@@ -463,6 +735,7 @@ Receive initial email batch and real-time new email notifications.
 ```
 
 2. **email_received** (new incoming email during session):
+
 ```json
 {
   "type": "email_received",
@@ -498,6 +771,7 @@ Receive initial email batch and real-time new email notifications.
 ```
 
 **Status Codes:**
+
 - `1008` - Policy Violation (invalid/missing JWT)
 
 ---
@@ -511,11 +785,10 @@ Receive analysis progress updates (partial results and completion).
 
 **WebSocket URL:** `ws://127.0.0.1:8000/ws/updates?token=<jwt_token>`
 
-
-
 **Server Messages:**
 
 1. **partial_update** (URLs case):
+
 ```json
 {
   "type": "partial_update",
@@ -535,6 +808,7 @@ Receive analysis progress updates (partial results and completion).
 ```
 
 2. **partial_update** (Headers case):
+
 ```json
 {
   "type": "partial_update",
@@ -551,6 +825,7 @@ Receive analysis progress updates (partial results and completion).
 ```
 
 3. **partial_update** (Body case):
+
 ```json
 {
   "type": "partial_update",
@@ -567,6 +842,7 @@ Receive analysis progress updates (partial results and completion).
 ```
 
 4. **partial_update** (Attachments case):
+
 ```json
 {
   "type": "partial_update",
@@ -582,13 +858,14 @@ Receive analysis progress updates (partial results and completion).
       "hash_sha256": "a1b2c3d4...",
       "status": "DONE",
       "verdict": "suspicious",
-      "reasons":[]
+      "reasons": []
     }
   ]
 }
 ```
 
 5. **analysis_complete** (all parts analyzed):
+
 ```json
 {
   "type": "analysis_complete",
@@ -623,8 +900,8 @@ Receive analysis progress updates (partial results and completion).
 ```
 
 **Field Values:**
+
 - `field`: `urls` | `body` | `headers` | `attachments`
 - `status`: `PENDING` | `PROCESSING` | `DONE` | `FAILED`
 - `final_verdict`: `SAFE` | `PHISHING`
 - `risk_score`: float (0.0 - 100.0)
-

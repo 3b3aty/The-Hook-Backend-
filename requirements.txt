@@ -7,4 +7,6 @@ PyJWT
 celery
 kombu
 redis
+google-cloud-pubsub
 dotenv
+python-multipart
