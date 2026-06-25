@@ -1,20 +1,355 @@
 # Email Security Backend - API Documentation
 
+## Table of Contents
+
+- Authentication
+- OAuth flow
+- HTTP endpoints (labels, emails, auth)
+- WebSocket endpoints
+- Errors and status codes
+- Examples
+
 ## Authentication
 
-### JWT Tokens
+### JWT Tokens (current behavior)
 
-After OAuth login, you receive:
+After a successful OAuth login the server issues two JWTs:
 
-- `jwt_token` (access token, valid 15 minutes)
-- `refresh_token` (valid 7 days)
+- `jwt_token` (access token): valid for 7 days (used for API requests and websocket auth)
+- `refresh_token`: valid for 7 days (stored server-side and can be used to manage sessions)
 
-### Auth Rule for Frontend
+Notes:
 
-- Protected HTTP endpoints use only the `Authorization: Bearer <jwt_token>` header.
-- WebSocket endpoints use the JWT in the query string, for example `?token=<jwt_token>`.
-- Do not send both a query token and an Authorization header for the same HTTP request.
-- In Swagger UI, use the **Authorize** button (top-right) to set the bearer token once.
+- The API currently uses a single long-lived token strategy (both access and refresh are 7 days). In production you may prefer short-lived access tokens (minutes) and long-lived refresh tokens.
+- The token payload includes `user_id`, `email`, `type` (`access` or `refresh`), and `exp` (expiry).
+
+### How to send tokens
+
+- HTTP: include the access token in the `Authorization` header:
+
+```
+Authorization: Bearer <jwt_token>
+```
+
+- WebSocket: include the token as a query parameter: `/ws/emails?token=<jwt_token>`.
+- Do not provide the token both in a query string and in the `Authorization` header for the same request.
+
+### Expires / TTL values
+
+- `expires_in` (seconds) returned by the server when issuing tokens: `604800` (7 days).
+
+## OAuth Flow
+
+1. Client requests `GET /auth/google/login` — server redirects to Google consent screen with scopes `openid email profile` and Gmail scopes.
+2. After user consent, Google redirects to `/auth/google/callback?code=...`.
+3. Server exchanges the `code` for Google tokens, retrieves the user's profile, creates or updates the local `User` record, issues JWTs and returns them to the client.
+
+Important integration note:
+
+- For single-page apps the front-end should open `GET /auth/google/login` to start the flow; the server handles the callback and returns the resulting tokens to the client (see the example response below).
+
+## HTTP Endpoints
+
+The API exposes standard REST endpoints. All endpoints below that require authentication expect a valid `jwt_token` as the `Authorization` header.
+
+### 1) GET /auth/google/login
+
+Purpose: Redirect user agent to Google OAuth consent.
+
+Auth: No
+
+Response: HTTP 302 redirect to Google consent URL.
+
+### 2) GET /auth/google/callback
+
+Purpose: OAuth callback — exchanges code for Google tokens and issues JWTs for the app.
+
+Auth: No (called by Google)
+
+Query parameters:
+
+- `code` (required): authorization code from Google
+
+Response JSON on success:
+
+```json
+{
+  "jwt_token": "eyJ...",
+  "refresh_token": "eyJ...",
+  "expires_in": 604800,
+  "user": {
+    "user_id": 42,
+    "google_id": "110170705258730366018",
+    "name": "John Doe",
+    "email": "john@gmail.com",
+    "photo_url": "https://lh3.googleusercontent.com/...",
+    "provider": "google"
+  }
+}
+```
+
+Status Codes:
+
+- `200` OK — successful login
+- `502` Bad Gateway — Google API error
+
+### 3) POST /auth/logout-and-reauth
+
+Purpose: Clear stored Google tokens for the user and force re-authorization.
+
+Auth: Yes
+
+Request headers:
+
+```
+Authorization: Bearer <jwt_token>
+Content-Type: application/json
+```
+
+Response JSON:
+
+```json
+{
+  "message": "Tokens cleared. Please go to /auth/google/login to re-authorize with the new permissions.",
+  "redirect_url": "/auth/google/login"
+}
+```
+
+Status codes: `200`, `401` if token missing or invalid.
+
+### 4) POST /labels
+
+Purpose: Create a user label.
+
+Auth: Yes
+
+Request JSON:
+
+```json
+{
+  "name": "Important",
+  "color": "#ff9900"
+}
+```
+
+Response JSON (201 or 200):
+
+```json
+{
+  "label_id": 12,
+  "name": "Important",
+  "color": "#ff9900",
+  "created_at": "2026-06-24T10:00:00+00:00"
+}
+```
+
+Errors: `400` bad input, `401` unauthorized.
+
+### 5) POST /label-rules
+
+Purpose: Add a rule that maps incoming emails from a given sender to a label and retroactively applies it to stored emails.
+
+Auth: Yes
+
+Request JSON:
+
+```json
+{
+  "label_id": 12,
+  "from_user_id": 7
+}
+```
+
+Response JSON:
+
+```json
+{
+  "rule_id": 3,
+  "label_id": 12,
+  "from_user_id": 7,
+  "created": true
+}
+```
+
+Errors: `400`, `401`, `404`.
+
+### 6) POST /emails/send
+
+Purpose: Send an email via Gmail on behalf of the authenticated user and persist a copy locally.
+
+Auth: Yes
+
+Request JSON:
+
+```json
+{
+  "recipients": ["alice@example.com", "bob@example.com"],
+  "subject": "Test Email",
+  "body": "Hello team, this is a test message."
+}
+```
+
+Response JSON on success:
+
+```json
+{
+  "email_id": 15,
+  "gmail_message_id": "187c1b5e87a10b23",
+  "status": "sent"
+}
+```
+
+Errors:
+
+- `400` invalid recipients
+- `401` missing/invalid JWT
+- `502` Gmail API error or insufficient scopes
+
+### 7) GET /emails
+
+Purpose: List authenticated user's emails with optional filters.
+
+Auth: Yes
+
+Query params:
+
+- `status` (`draft`|`sent`|`all`) — default `all`
+- `label_id` (int) — filter by label
+- `from_user_id` (int) — filter by sender
+
+Response JSON: paginated `emails` array.
+
+### 8) PATCH /emails/{email_id}/read
+
+Purpose: Mark an email read.
+
+Auth: Yes
+
+Response JSON:
+
+```json
+{
+  "email_id": 5,
+  "is_read": true
+}
+```
+
+Errors: `401`, `404`.
+
+### 9) PATCH /emails/{email_id}/trash
+
+Purpose: Set or clear trash flag on an email. Query `value=true|false`.
+
+Auth: Yes
+
+Response JSON: `is_trash` flag.
+
+### 10) PATCH /emails/{email_id}/star
+
+Purpose: Set or clear starred flag. Query `value=true|false`.
+
+Auth: Yes
+
+Response JSON: `is_starred` flag.
+
+### 11) PATCH /emails/{email_id}/draft_edit
+
+Purpose: Edit an existing draft. Use `multipart/form-data` when uploading attachments.
+
+Auth: Yes
+
+Request fields: `subject`, `body`, `recipients`, `delete_attachment_ids`, `files`.
+
+### 12) DELETE /emails/{email_id}
+
+Purpose: Delete an email and remove it from Gmail if present.
+
+Auth: Yes
+
+Response JSON:
+
+```json
+{
+  "email_id": 5,
+  "deleted": true,
+  "gmail_deleted": true
+}
+```
+
+Errors: `401`, `404`, `502`.
+
+## WebSocket Endpoints
+
+WebSocket connections require a valid `jwt_token` provided as a query parameter (`?token=<jwt_token>`).
+
+### 1) /ws/emails
+
+Purpose: On connect, send an `initial_emails` message with user emails, then push `email_received` messages for new incoming mail.
+
+Example connect URL:
+
+```
+ws://127.0.0.1:8000/ws/emails?token=<jwt_token>
+```
+
+Messages:
+
+- `initial_emails` — full initial batch
+- `email_received` — single new email
+
+### 2) /ws/updates
+
+Purpose: Receive incremental analysis updates for email processing (URLs, headers, body, attachments).
+
+Messages include `partial_update` and `analysis_complete` events.
+
+## Error Codes
+
+Common HTTP status codes used by the API:
+
+- `200` OK
+- `201` Created
+- `400` Bad Request
+- `401` Unauthorized — missing/invalid JWT
+- `404` Not Found
+- `502` Bad Gateway — upstream (Google/Gmail) or integration error
+
+Error response format:
+
+```json
+{
+  "detail": "Human-readable error message"
+}
+```
+
+Common error messages:
+
+- `Missing JWT token` — no token provided
+- `Invalid JWT token` — signature invalid
+- `JWT token expired` — token `exp` passed
+
+## Examples
+
+1. Call protected endpoint with curl:
+
+```bash
+curl -H "Authorization: Bearer $JWT" http://127.0.0.1:8000/emails
+```
+
+2. Connect to emails websocket (Node example):
+
+```js
+const ws = new WebSocket("ws://127.0.0.1:8000/ws/emails?token=" + JWT);
+ws.onmessage = (m) => console.log(JSON.parse(m.data));
+```
+
+## Notes & Recommendations
+
+- The current token strategy is simple; consider shortening `jwt_token` lifetime and introducing a refresh endpoint.
+- Ensure `JWT_SECRET` is set in production and rotated periodically.
+- Keep `GOOGLE_CLIENT_SECRET` out of source control and restrict redirect URIs in Google Console.
+
+If you want, I can also generate OpenAPI-compatible examples or add a `curl` script directory with quick integration tests.
 
 ## Email Endpoints
 
@@ -193,7 +528,7 @@ Create a label for the authenticated user.
 ### 5. POST /label-rules
 
 **Purpose:**  
-Add a user to a specific label by creating a row in the `label_rules` table and backfilling matching emails into `email_labels`.
+Add a user to a specific label by creating a row in the `label_rules` table and applying the rule to existing emails from that sender.
 
 **Auth Required:** Yes (JWT)
 
@@ -217,19 +552,16 @@ Add a user to a specific label by creating a row in the `label_rules` table and 
 
 **Behavior:**
 
-- Adds a `label_rules` row for the authenticated user.
-- Finds all existing emails received by the current user from `from_user_id` and creates matching rows in `email_labels`.
-- Reusing the same rule is idempotent and only backfills missing `email_labels` rows.
-
-**Response JSON (Success):**
+- Creates a new `label_rules` row.
+- Inserts `email_labels` rows for any existing emails received from `from_user_id` so they immediately belong to the label.
+- Any new incoming emails from `from_user_id` are also automatically recorded in `email_labels` for this label when they arrive.
 
 ```json
 {
   "rule_id": 3,
   "label_id": 12,
   "from_user_id": 7,
-  "created": true,
-  "tagged_emails_count": 42
+  "created": true
 }
 ```
 
@@ -386,6 +718,11 @@ Content-Type: application/json
 }
 ```
 
+**Behavior:**
+
+- Marks the local email as read.
+- If the email has a `gmail_message_id`, it also removes the `UNREAD` label in Gmail.
+
 **Status Codes:**
 
 - `200` OK
@@ -440,6 +777,11 @@ Content-Type: application/json
 }
 ```
 
+**Behavior:**
+
+- Marks the local email as trash/untrash.
+- If the email has a `gmail_message_id`, it also adds/removes the `TRASH` label in Gmail.
+
 **Status Codes:**
 
 - `200` OK
@@ -493,6 +835,11 @@ Content-Type: application/json
   "is_starred": false
 }
 ```
+
+**Behavior:**
+
+- Marks the local email as starred/unstarred.
+- If the email has a `gmail_message_id`, it also adds/removes the `STARRED` label in Gmail.
 
 **Status Codes:**
 

@@ -152,7 +152,7 @@ async def _pubsub_listener() -> None:
             pass
 
 
-@app.post("/pubsub/push", tags=['pubsub'])
+@app.post("/pubsub/push", tags = ['PubSub'])
 async def pubsub_push(request: Request):
     """Endpoint to receive Pub/Sub push messages (no local GCP credentials required).
 
@@ -412,7 +412,7 @@ def _decode_jwt_token(token: str) -> Dict[str, Any]:
 
 
 def _create_jwt_tokens(user_id: int, email: str) -> Dict[str, Any]:
-    access_expiry = datetime.now(timezone.utc) + timedelta(minutes=15)
+    access_expiry = datetime.now(timezone.utc) + timedelta(days=7)
     refresh_expiry = datetime.now(timezone.utc) + timedelta(days=7)
 
     access_token = jwt.encode(
@@ -554,6 +554,45 @@ def _gmail_delete_message(user: models.User, db: Session, message_id: str) -> No
             detail += " | RESOLUTION: Visit https://myaccount.google.com/permissions, revoke this app, then re-login via /auth/google/login"
         raise HTTPException(
             status_code=502, detail=f"Failed to delete Gmail message: {detail}")
+
+
+def _gmail_modify_message_labels(
+    user: models.User,
+    db: Session,
+    message_id: str,
+    add_labels: Optional[List[str]] = None,
+    remove_labels: Optional[List[str]] = None,
+) -> None:
+    modify_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}/modify"
+    access_token = _get_valid_google_access_token(user, db)
+    payload = {}
+    if add_labels is not None:
+        payload["addLabelIds"] = add_labels
+    if remove_labels is not None:
+        payload["removeLabelIds"] = remove_labels
+
+    res = requests.post(
+        modify_url,
+        headers={"Authorization": f"Bearer {access_token}"},
+        json=payload,
+        timeout=15,
+    )
+
+    if res.status_code == 401:
+        access_token = _refresh_google_access_token(user, db)
+        res = requests.post(
+            modify_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            json=payload,
+            timeout=15,
+        )
+
+    if not res.ok:
+        detail = res.text
+        if res.status_code == 403 and "insufficientPermissions" in detail:
+            detail += " | RESOLUTION: Visit https://myaccount.google.com/permissions, revoke this app, then re-login via /auth/google/login"
+        raise HTTPException(
+            status_code=502, detail=f"Failed to modify Gmail labels: {detail}")
 
 
 def _collect_attachments(payload: Dict[str, Any], out: List[Dict[str, Any]]) -> None:
@@ -769,6 +808,38 @@ def _get_or_create_category(db: Session, name: str) -> models.Category:
     return category
 
 
+def _apply_label_rules_to_email(
+    db: Session,
+    receiver_id: Optional[int],
+    sender_id: Optional[int],
+    email_id: int,
+) -> None:
+    if receiver_id is None or sender_id is None:
+        return
+
+    rules = db.query(models.LabelRule).filter(
+        models.LabelRule.user_id == receiver_id,
+        models.LabelRule.from_user_id == sender_id,
+    ).all()
+    if not rules:
+        return
+
+    existing_label_ids = {
+        label_id
+        for (label_id,) in db.query(models.EmailLabel.label_id)
+        .filter(models.EmailLabel.email_id == email_id)
+        .all()
+    }
+
+    rows_to_insert = [
+        {"email_id": email_id, "label_id": rule.label_id}
+        for rule in rules
+        if rule.label_id not in existing_label_ids
+    ]
+    if rows_to_insert:
+        db.bulk_insert_mappings(models.EmailLabel, rows_to_insert)
+
+
 def _load_user_emails(db: Session, user_id: int, limit: int = 60) -> List[models.Email]:
     return (
         db.query(models.Email)
@@ -828,7 +899,7 @@ def _normalize_int_list(value: Any) -> List[int]:
     return list(dict.fromkeys(ids))
 
 
-@app.get("/emails", tags=['emails'])
+@app.get("/emails", tags = ['emails'])
 def get_emails(
     status: str = Query("all"),
     label_id: Optional[int] = Query(None, ge=1),
@@ -985,6 +1056,13 @@ def _fetch_and_store_emails_for_user(
         )
         db.add(interface_record)
 
+        _apply_label_rules_to_email(
+            db,
+            receiver_id=receiver_user.id if receiver_user else None,
+            sender_id=sender_user.id if sender_user else None,
+            email_id=email_record.id,
+        )
+
         header_info = extract_headers(headers)
         header_record = models.EmailHeaders(
             email_id=email_record.id,
@@ -1062,7 +1140,7 @@ def _fetch_and_store_emails_for_user(
     return {"stored": stored, "skipped": skipped, "fetched": len(messages)}
 
 
-@app.get("/auth/google/login", tags=['login'])
+@app.get("/auth/google/login", tags = ['login/logout'])
 def login():
     url = (
         "https://accounts.google.com/o/oauth2/v2/auth"
@@ -1076,7 +1154,7 @@ def login():
     return RedirectResponse(url)
 
 
-@app.get("/auth/google/callback", tags=['login'])
+@app.get("/auth/google/callback", tags = ['login/logout'])
 def callback(code: str, db: Session = Depends(get_db)):
     token_res = requests.post(
         "https://oauth2.googleapis.com/token",
@@ -1162,7 +1240,7 @@ def callback(code: str, db: Session = Depends(get_db)):
     return payload
 
 
-@app.post("/auth/logout-and-reauth", tags=['logout'])
+@app.post("/auth/logout-and-reauth", tags = ['login/logout'])
 def logout_and_reauth(
     user: models.User = Depends(get_current_user_from_auth),
     db: Session = Depends(get_db),
@@ -1178,7 +1256,7 @@ def logout_and_reauth(
     }
 
 
-@app.post("/labels", tags=['labels'])
+@app.post("/labels", tags = ['labels'])
 def create_label(
     name: str = Body(...),
     color: Optional[str] = Body(None),
@@ -1213,7 +1291,7 @@ def create_label(
     }
 
 
-@app.get("/labels", tags=['labels'])
+@app.get("/labels", tags = ['labels'])
 def get_labels(
     user: models.User = Depends(get_current_user_from_auth),
     db: Session = Depends(get_db),
@@ -1238,7 +1316,7 @@ def get_labels(
     }
 
 
-@app.delete("/labels/{label_id}", tags=['labels'])
+@app.delete("/labels/{label_id}", tags = ['labels'])
 def delete_label(
     label_id: int,
     user: models.User = Depends(get_current_user_from_auth),
@@ -1270,44 +1348,7 @@ def _get_owned_label(db: Session, user_id: int, label_id: int) -> Optional[model
     )
 
 
-def _backfill_label_emails_for_rule(db: Session, user_id: int, label_id: int, from_user_id: int) -> int:
-    email_ids = [
-        row[0]
-        for row in (
-            db.query(models.Email.id)
-            .join(models.Interface, models.Interface.email_id == models.Email.id)
-            .filter(
-                models.Interface.receiver_id == user_id,
-                models.Interface.sender_id == from_user_id,
-            )
-            .distinct()
-            .all()
-        )
-    ]
-    if not email_ids:
-        return 0
-
-    existing_email_ids = {
-        row[0]
-        for row in db.query(models.EmailLabel.email_id)
-        .filter(
-            models.EmailLabel.label_id == label_id,
-            models.EmailLabel.email_id.in_(email_ids),
-        )
-        .all()
-    }
-
-    created_count = 0
-    for email_id in email_ids:
-        if email_id in existing_email_ids:
-            continue
-        db.add(models.EmailLabel(email_id=email_id, label_id=label_id))
-        created_count += 1
-
-    return created_count
-
-
-@app.post("/label-rules", tags=['label_rules'])
+@app.post("/label-rules", tags = ['label-rules'])
 def create_label_rule(
     label_id: int = Body(..., ge=1),
     from_user_id: int = Body(..., ge=1),
@@ -1318,8 +1359,7 @@ def create_label_rule(
     if not label:
         raise HTTPException(status_code=404, detail="Label not found")
 
-    from_user = db.query(models.User).filter(
-        models.User.id == from_user_id).first()
+    from_user = db.query(models.User).filter(models.User.id == from_user_id).first()
     if not from_user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -1333,11 +1373,6 @@ def create_label_rule(
         .first()
     )
     if existing_rule:
-        tagged_emails_count = _backfill_label_emails_for_rule(
-            db, user.id, label_id, from_user_id
-        )
-        if tagged_emails_count:
-            db.commit()
         return {
             "rule_id": existing_rule.id,
             "label_id": existing_rule.label_id,
@@ -1351,22 +1386,51 @@ def create_label_rule(
         from_user_id=from_user_id,
     )
     db.add(rule)
-    tagged_emails_count = _backfill_label_emails_for_rule(
-        db, user.id, label_id, from_user_id
-    )
     db.commit()
     db.refresh(rule)
+
+    # Backfill existing emails from this sender into the label
+    existing_email_ids = [
+        email_id
+        for (email_id,) in db.query(models.Email.id)
+        .join(models.Interface, models.Interface.email_id == models.Email.id)
+        .filter(
+            models.Interface.receiver_id == user.id,
+            models.Interface.sender_id == from_user_id,
+        )
+        .all()
+    ]
+
+    if existing_email_ids:
+        already_labeled_ids = {
+            email_id
+            for (email_id,) in db.query(models.EmailLabel.email_id)
+            .filter(
+                models.EmailLabel.label_id == label_id,
+                models.EmailLabel.email_id.in_(existing_email_ids),
+            )
+            .all()
+        }
+
+        rows_to_insert = [
+            {"email_id": email_id, "label_id": label_id}
+            for email_id in existing_email_ids
+            if email_id not in already_labeled_ids
+        ]
+
+        if rows_to_insert:
+            db.bulk_insert_mappings(models.EmailLabel, rows_to_insert)
+            db.commit()
 
     return {
         "rule_id": rule.id,
         "label_id": rule.label_id,
         "from_user_id": rule.from_user_id,
         "created": True,
-        "tagged_emails_count": tagged_emails_count,
     }
 
 
-@app.get("/label-rules", tags=['label_rules'])
+@app.get("/label-rules", tags = ['label-rules'])
 def get_label_rules(
     label_id: int = Query(..., ge=1),
     user: models.User = Depends(get_current_user_from_auth),
@@ -1398,7 +1462,7 @@ def get_label_rules(
     }
 
 
-@app.delete("/label-rules", tags=['label_rules'])
+@app.delete("/label-rules", tags = ['label-rules'])
 def delete_label_rule(
     label_id: int = Body(..., ge=1),
     from_user_id: int = Body(..., ge=1),
@@ -1432,7 +1496,7 @@ def delete_label_rule(
     }
 
 
-@app.post("/emails/send", tags=['emails'])
+@app.post("/emails/send", tags = ['emails'])
 def send_email(
     recipients: List[str] = Body(...),
     subject: Optional[str] = Body(None),
@@ -1624,7 +1688,7 @@ def send_email(
     }
 
 
-@app.patch("/emails/{email_id}/read", tags=['flags'])
+@app.patch("/emails/{email_id}/read", tags = ['flags'])
 def mark_email_read(
     email_id: int,
     user: models.User = Depends(get_current_user_from_auth),
@@ -1639,13 +1703,21 @@ def mark_email_read(
     if not email:
         raise HTTPException(status_code=404, detail="Email not found")
 
+    if email.gmail_message_id:
+        _gmail_modify_message_labels(
+            user,
+            db,
+            email.gmail_message_id,
+            remove_labels=["UNREAD"],
+        )
+
     email.is_read = True
     db.commit()
 
     return {"email_id": email_id, "is_read": True}
 
 
-@app.patch("/emails/{email_id}/trash", tags=['flags'])
+@app.patch("/emails/{email_id}/trash", tags = ['flags'])
 def mark_email_trash(
     email_id: int,
     value: bool = True,
@@ -1661,13 +1733,29 @@ def mark_email_trash(
     if not email:
         raise HTTPException(status_code=404, detail="Email not found")
 
+    if email.gmail_message_id:
+        if value:
+            _gmail_modify_message_labels(
+                user,
+                db,
+                email.gmail_message_id,
+                add_labels=["TRASH"],
+            )
+        else:
+            _gmail_modify_message_labels(
+                user,
+                db,
+                email.gmail_message_id,
+                remove_labels=["TRASH"],
+            )
+
     email.is_trash = value
     db.commit()
 
     return {"email_id": email_id, "is_trash": email.is_trash}
 
 
-@app.patch("/emails/{email_id}/star", tags=['flags'])
+@app.patch("/emails/{email_id}/star", tags = ['flags'])
 def mark_email_starred(
     email_id: int,
     value: bool = True,
@@ -1683,13 +1771,29 @@ def mark_email_starred(
     if not email:
         raise HTTPException(status_code=404, detail="Email not found")
 
+    if email.gmail_message_id:
+        if value:
+            _gmail_modify_message_labels(
+                user,
+                db,
+                email.gmail_message_id,
+                add_labels=["STARRED"],
+            )
+        else:
+            _gmail_modify_message_labels(
+                user,
+                db,
+                email.gmail_message_id,
+                remove_labels=["STARRED"],
+            )
+
     email.is_starred = value
     db.commit()
 
     return {"email_id": email_id, "is_starred": email.is_starred}
 
 
-@app.patch("/emails/{email_id}/draft_edit", tags=['emails'])
+@app.patch("/emails/{email_id}/draft_edit", tags = ['emails'])
 async def draft_edit(
     email_id: int,
     request: Request,
@@ -1882,7 +1986,7 @@ async def draft_edit(
     }
 
 
-@app.delete("/emails/{email_id}", tags=['emails'])
+@app.delete("/emails/{email_id}", tags = ['emails'])
 def delete_email(
     email_id: int,
     user: models.User = Depends(get_current_user_from_auth),
