@@ -37,6 +37,8 @@ pip install -r requirements.txt
 GOOGLE_CLIENT_ID=your-google-client-id
 GOOGLE_CLIENT_SECRET=your-google-client-secret
 GOOGLE_REDIRECT_URI=http://localhost:8000/auth/google/callback
+GCP_PUBSUB_SUBSCRIPTION=your-GCP_PUBSUB_SUBSCRIPTION
+GCP_PUBSUB_TOPIC=your-GCP_PUBSUB_SUBSCRIPTION
 
 # JWT
 JWT_SECRET=change-this
@@ -55,21 +57,31 @@ REDIS_WS_CHANNEL=ws_updates
 
 ## Running
 
-### 1) Start the API server
+1. **Open Command Prompt in the project folder**
 
-```bash
-uvicorn main:app --reload
-```
+2. **Activate the virtual environment:**
 
-### 2) Start Celery workers
+   ```bash
+   venv\Scripts\activate
+   ```
 
-```bash
-celery -A celery_app.celery_app worker -l info
-```
+3. **Start Celery workers** (in one terminal):
 
-### 3) Start Redis and RabbitMQ
+   ```bash
+   celery -A celery_app.celery_app worker -Q url_queue,body_queue,headers_queue,attachments_queue --loglevel=info --pool=solo --concurrency=1 --without-mingle --without-gossip
+   ```
 
-Make sure Redis and RabbitMQ are running locally or update the URLs in `.env` to point to your services.
+4. **Set up ngrok** (in a separate command prompt):
+   - Navigate to the folder where ngrok is stored
+   - Run:
+     ```bash
+     ngrok http 8000
+     ```
+
+5. **Run the project** (in the project terminal):
+   ```bash
+   uvicorn main:app --reload
+   ```
 
 ## Notes
 
