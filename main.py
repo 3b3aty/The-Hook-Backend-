@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Body, Request, File, UploadFile, Query
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Body, Request, Query, UploadFile
 from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
@@ -8,13 +8,15 @@ from contextlib import suppress
 import hashlib
 import html
 import json
+import mimetypes
 import re
 import shutil
 from datetime import datetime, timezone, timedelta
 from email.utils import parseaddr, parsedate_to_datetime
 from email.message import EmailMessage
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 import requests
+from pydantic import BaseModel, Field
 from urllib.parse import urlencode
 import jwt
 from redis.asyncio import Redis
@@ -81,8 +83,25 @@ def _process_pubsub_notification(email_address: Optional[str], history_id: Optio
             logger.info("Pub/Sub: user not found for email %s", email_address)
             return
 
-        # Use existing sync function to fetch and store emails for this user.
         try:
+            if history_id and user.last_history_id:
+                try:
+                    history_payload = _gmail_get_history(user, db, user.last_history_id)
+                    records = history_payload.get("history", []) or []
+                    if records:
+                        _process_gmail_history_records(
+                            user, db, records, notify_user_id=user.id
+                        )
+                    user.last_history_id = history_id
+                    db.commit()
+                    return
+                except HTTPException as exc:
+                    logger.warning(
+                        "Gmail history sync failed for %s: %s",
+                        email_address,
+                        exc.detail,
+                    )
+
             _fetch_and_store_emails_for_user(
                 user,
                 db,
@@ -90,6 +109,16 @@ def _process_pubsub_notification(email_address: Optional[str], history_id: Optio
                 notify_user_id=user.id,
                 send_each_email=True,
             )
+            if history_id:
+                user.last_history_id = history_id
+            else:
+                try:
+                    profile = _gmail_get_profile(user, db)
+                    if profile.get("historyId"):
+                        user.last_history_id = profile.get("historyId")
+                except Exception:
+                    pass
+            db.commit()
         except Exception:
             logger.exception(
                 "Error fetching/storing emails for user %s", email_address)
@@ -531,6 +560,150 @@ def _gmail_get_json(user: models.User, db: Session, url: str, params: Optional[D
     return res.json()
 
 
+def _gmail_get_profile(user: models.User, db: Session) -> Dict[str, Any]:
+    profile_url = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+    return _gmail_get_json(user, db, profile_url)
+
+
+def _gmail_get_history(user: models.User, db: Session, start_history_id: str) -> Dict[str, Any]:
+    history_url = "https://gmail.googleapis.com/gmail/v1/users/me/history"
+    return _gmail_get_json(
+        user,
+        db,
+        history_url,
+        params={"startHistoryId": start_history_id},
+    )
+
+
+def _delete_local_email(db: Session, email: models.Email) -> None:
+    attachment_dir = os.path.join(ATTACHMENTS_DIR, str(email.id))
+
+    db.query(models.StaticAnalysis).filter(
+        models.StaticAnalysis.attach_id.in_(
+            db.query(models.Attachments.id).filter(
+                models.Attachments.email_id == email.id)
+        )
+    ).delete(synchronize_session=False)
+    db.query(models.DynamicAnalysis).filter(
+        models.DynamicAnalysis.attach_id.in_(
+            db.query(models.Attachments.id).filter(
+                models.Attachments.email_id == email.id)
+        )
+    ).delete(synchronize_session=False)
+    db.query(models.AnalysisTask).filter(
+        models.AnalysisTask.email_id == email.id).delete(synchronize_session=False)
+    db.query(models.BodyClassification).filter(
+        models.BodyClassification.email_id == email.id).delete(synchronize_session=False)
+    db.query(models.EmailHeaders).filter(
+        models.EmailHeaders.email_id == email.id).delete(synchronize_session=False)
+    db.query(models.UrlsExtracted).filter(
+        models.UrlsExtracted.email_id == email.id).delete(synchronize_session=False)
+    db.query(models.EmailDeadline).filter(
+        models.EmailDeadline.email_id == email.id).delete(synchronize_session=False)
+    db.query(models.UserAction).filter(
+        models.UserAction.email_id == email.id).delete(synchronize_session=False)
+    db.query(models.EmailLabel).filter(
+        models.EmailLabel.email_id == email.id).delete(synchronize_session=False)
+    db.query(models.Interface).filter(
+        models.Interface.email_id == email.id).delete(synchronize_session=False)
+    db.query(models.Attachments).filter(
+        models.Attachments.email_id == email.id).delete(synchronize_session=False)
+    db.delete(email)
+    if os.path.isdir(attachment_dir):
+        shutil.rmtree(attachment_dir, ignore_errors=True)
+
+
+def _sync_gmail_message_state(
+    user: models.User,
+    db: Session,
+    message: Dict[str, Any],
+    notify_user_id: Optional[int] = None,
+) -> bool:
+    message_id = message.get("id")
+    if not message_id:
+        return False
+
+    existing = db.query(models.Email).filter(
+        models.Email.gmail_message_id == message_id).first()
+    if not existing:
+        return False
+
+    if message.get("labelIds") is None:
+        message_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}"
+        message = _gmail_get_json(user, db, message_url, params={"format": "full"})
+
+    return _sync_existing_email_with_gmail_message(
+        db, existing, message, notify_user_id=notify_user_id
+    )
+
+
+def _process_gmail_history_records(
+    user: models.User,
+    db: Session,
+    records: List[Dict[str, Any]],
+    notify_user_id: Optional[int] = None,
+) -> int:
+    updated = 0
+    for record in records:
+        for message_data in (
+            record.get("messages", [])
+            + record.get("messagesAdded", [])
+            + record.get("messagesRemoved", [])
+        ):
+            if _sync_gmail_message_state(user, db, message_data, notify_user_id=notify_user_id):
+                updated += 1
+
+        for label_change in (
+            record.get("labelsAdded", []) + record.get("labelsRemoved", [])
+        ):
+            message_payload = label_change.get("message") if isinstance(label_change, dict) else None
+            if message_payload and _sync_gmail_message_state(
+                user, db, message_payload, notify_user_id=notify_user_id
+            ):
+                updated += 1
+
+        for deleted in record.get("messagesDeleted", []):
+            message_payload = deleted.get("message") if isinstance(deleted, dict) else deleted
+            if not isinstance(message_payload, dict):
+                continue
+            message_id = message_payload.get("id")
+            if not message_id:
+                continue
+            existing = db.query(models.Email).filter(
+                models.Email.gmail_message_id == message_id
+            ).first()
+            if existing:
+                _delete_local_email(db, existing)
+                updated += 1
+
+    return updated
+
+
+def _gmail_trash_message(user: models.User, db: Session, message_id: str) -> None:
+    trash_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}/trash"
+    access_token = _get_valid_google_access_token(user, db)
+    res = requests.post(
+        trash_url,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=15,
+    )
+
+    if res.status_code == 401:
+        access_token = _refresh_google_access_token(user, db)
+        res = requests.post(
+            trash_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=15,
+        )
+
+    if not res.ok:
+        detail = res.text
+        if res.status_code == 403 and "insufficientPermissions" in detail:
+            detail += " | RESOLUTION: Visit https://myaccount.google.com/permissions, revoke this app, then re-login via /auth/google/login"
+        raise HTTPException(
+            status_code=502, detail=f"Failed to trash Gmail message: {detail}")
+
+
 def _gmail_delete_message(user: models.User, db: Session, message_id: str) -> None:
     delete_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}"
     access_token = _get_valid_google_access_token(user, db)
@@ -788,6 +961,46 @@ def _send_email_received(db: Session, user_id: int, email: models.Email) -> None
     )
 
 
+def _send_email_updated(db: Session, user_id: int, email: models.Email) -> None:
+    manager.send_json_sync(
+        user_id,
+        {
+            "type": "email_updated",
+            "email": _serialize_email_for_user(db, email, user_id),
+        },
+    )
+
+
+def _sync_existing_email_with_gmail_message(
+    db: Session,
+    email_record: models.Email,
+    message: Dict[str, Any],
+    notify_user_id: Optional[int] = None,
+) -> bool:
+    labels = message.get("labelIds") or []
+    is_starred = "STARRED" in labels
+    is_trash = "TRASH" in labels
+    is_read = "UNREAD" not in labels
+
+    changed = False
+    if email_record.is_starred != is_starred:
+        email_record.is_starred = is_starred
+        changed = True
+    if email_record.is_trash != is_trash:
+        email_record.is_trash = is_trash
+        changed = True
+    if email_record.is_read != is_read:
+        email_record.is_read = is_read
+        changed = True
+
+    if changed:
+        db.commit()
+        if notify_user_id is not None:
+            _send_email_updated(db, notify_user_id, email_record)
+
+    return changed
+
+
 def _extract_category_name(label_ids: List[str]) -> str:
     if "CATEGORY_PROMOTIONS" in label_ids:
         return "Promotions"
@@ -889,6 +1102,19 @@ def _normalize_string_list(value: Any) -> List[str]:
     return normalized
 
 
+class SendEmailRequest(BaseModel):
+    recipients: Optional[List[str]] = Field(
+        None,
+        description="List of recipient email addresses",
+    )
+    subject: Optional[str] = Field(None, description="Email subject")
+    body: Optional[str] = Field(None, description="Email body")
+    delivery_status: Optional[str] = Field(
+        "draft",
+        description='Email send state: "draft" or "sent"',
+    )
+
+
 def _normalize_int_list(value: Any) -> List[int]:
     ids: List[int] = []
     for item in _normalize_string_list(value):
@@ -960,27 +1186,37 @@ def _fetch_and_store_emails_for_user(
         user,
         db,
         list_url,
-        params={"maxResults": max_results},
+        params={
+            "maxResults": max_results,
+            "includeSpamTrash": "true",
+            "q": "in:anywhere",
+        },
     )
 
     messages = list_payload.get("messages", []) or []
     stored = 0
     skipped = 0
+    updated = 0
 
     for item in messages:
         message_id = item.get("id")
         if not message_id:
             continue
 
-        existing = db.query(models.Email).filter(
-            models.Email.gmail_message_id == message_id).first()
-        if existing:
-            skipped += 1
-            continue
-
         message_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}"
         message = _gmail_get_json(
             user, db, message_url, params={"format": "full"})
+
+        existing = db.query(models.Email).filter(
+            models.Email.gmail_message_id == message_id).first()
+        if existing:
+            if _sync_existing_email_with_gmail_message(
+                db, existing, message, notify_user_id=notify_user_id
+            ):
+                updated += 1
+            else:
+                skipped += 1
+            continue
 
         payload = message.get("payload", {})
         headers = payload.get("headers", []) or []
@@ -1011,6 +1247,10 @@ def _fetch_and_store_emails_for_user(
         category_name = _extract_category_name(labels)
         category = _get_or_create_category(db, category_name)
 
+        is_starred = "STARRED" in labels
+        is_trash = "TRASH" in labels
+        is_read = "UNREAD" not in labels
+
         email_record = models.Email(
             gmail_message_id=message_id,
             thread_id=message.get("threadId"),
@@ -1026,6 +1266,9 @@ def _fetch_and_store_emails_for_user(
             attachments_status="PENDING",
             body_status="PENDING",
             headers_status="PENDING",
+            is_starred=is_starred,
+            is_trash=is_trash,
+            is_read=is_read,
         )
         db.add(email_record)
         db.flush()
@@ -1137,7 +1380,12 @@ def _fetch_and_store_emails_for_user(
     user.last_email_sync = datetime.now(timezone.utc)
     db.commit()
 
-    return {"stored": stored, "skipped": skipped, "fetched": len(messages)}
+    return {
+        "stored": stored,
+        "skipped": skipped,
+        "updated": updated,
+        "fetched": len(messages),
+    }
 
 
 @app.get("/auth/google/login", tags = ['login/logout'])
@@ -1497,16 +1745,34 @@ def delete_label_rule(
 
 
 @app.post("/emails/send", tags = ['emails'])
-def send_email(
-    recipients: List[str] = Body(...),
-    subject: Optional[str] = Body(None),
-    body: Optional[str] = Body(None),
-    delivery_status: str = Body("draft"),
-    files: List[UploadFile] = File(None),
+async def send_email(
+    request: Request,
+    payload: Optional[SendEmailRequest] = Body(None),
     user: models.User = Depends(get_current_user_from_auth),
     db: Session = Depends(get_db),
 ):
-    if not recipients or not isinstance(recipients, list):
+    content_type = (request.headers.get("content-type") or "").lower()
+    recipients_raw: Any = None
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    delivery_status: str = "draft"
+
+    if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+        form = await request.form()
+        recipients_raw = form.getlist("recipients") or form.getlist("to")
+        subject = form.get("subject")
+        body = form.get("body")
+        delivery_status = form.get("delivery_status") or "draft"
+    else:
+        if payload is None:
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+        recipients_raw = payload.recipients
+        subject = payload.subject
+        body = payload.body
+        delivery_status = payload.delivery_status or "draft"
+
+    recipients = _normalize_string_list(recipients_raw)
+    if not recipients:
         raise HTTPException(
             status_code=400, detail="recipients must be a non-empty list of email addresses")
 
@@ -1515,7 +1781,6 @@ def send_email(
         raise HTTPException(
             status_code=400, detail='delivery_status must be either "sent" or "draft"')
 
-    # Build RFC822 message
     msg = EmailMessage()
     msg["From"] = user.email
     msg["To"] = ", ".join(recipients)
@@ -1560,108 +1825,47 @@ def send_email(
         db.add(models.UrlsExtracted(
             email_id=email_record.id, url=u, status="PENDING"))
 
-    db.commit()
-
-    # Handle file attachments
-    attachment_list = []
-    if files:
-        email_att_dir = os.path.join(ATTACHMENTS_DIR, str(email_record.id))
-        os.makedirs(email_att_dir, exist_ok=True)
-
-        for file in files:
-            if not file or not file.filename:
-                continue
-
-            file_content = file.file.read()
-            attachment_hash = hashlib.sha256(file_content).hexdigest()
-            file_size = len(file_content)
-
-            file_path = os.path.join(email_att_dir, file.filename)
-            with open(file_path, "wb") as f:
-                f.write(file_content)
-
-            attachment_record = models.Attachments(
-                email_id=email_record.id,
-                file_name=file.filename,
-                file_type=file.content_type or "application/octet-stream",
-                file_size=file_size,
-                hash_sha256=attachment_hash,
-                file_url=file_path,
-                status="PENDING",
-            )
-            db.add(attachment_record)
-            attachment_list.append({
-                "filename": file.filename,
-                "content": file_content,
-                "mime_type": file.content_type or "application/octet-stream"
-            })
-
-    db.commit()
-
     if normalized_delivery_status == "draft":
+        db.commit()
         return {
             "email_id": email_record.id,
             "gmail_message_id": None,
             "status": "draft",
             "delivery_status": normalized_delivery_status,
-            "attachments_count": len(attachment_list),
         }
 
-    # Add attachments to RFC822 message
-    for attachment in attachment_list:
-        mime_parts = attachment["mime_type"].split("/")
-        maintype = mime_parts[0]
-        subtype = mime_parts[1] if len(mime_parts) > 1 else "octet-stream"
-        msg.add_attachment(
-            attachment["content"],
-            maintype=maintype,
-            subtype=subtype,
-            filename=attachment["filename"]
-        )
-
     raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-
     send_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
     access_token = _get_valid_google_access_token(user, db)
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    res = requests.post(send_url, headers=headers, json={
-                        "raw": raw_b64}, timeout=20)
-
-    # Retry on 401 or 403 insufficient scopes
+    res = requests.post(send_url, headers=headers, json={"raw": raw_b64}, timeout=20)
     if res.status_code in (401, 403):
         access_token = _refresh_google_access_token(user, db)
         headers = {"Authorization": f"Bearer {access_token}"}
-        res = requests.post(send_url, headers=headers, json={
-                            "raw": raw_b64}, timeout=20)
+        res = requests.post(send_url, headers=headers, json={"raw": raw_b64}, timeout=20)
 
     if not res.ok:
         error_detail = res.text
-        # Check if it's a scope issue after retry
         if res.status_code == 403 and "insufficientPermissions" in error_detail:
             error_detail += " | RESOLUTION: Visit https://myaccount.google.com/permissions, revoke this app, then re-login via /auth/google/login"
-        raise HTTPException(
-            status_code=502, detail=f"Failed to send email: {error_detail}")
+        raise HTTPException(status_code=502, detail=f"Failed to send email: {error_detail}")
 
     payload = res.json()
     message_id = payload.get("id")
     thread_id = payload.get("threadId")
-
     if not message_id:
-        raise HTTPException(
-            status_code=502, detail="Gmail did not return message id")
+        raise HTTPException(status_code=502, detail="Gmail did not return message id")
 
-    existing = db.query(models.Email).filter(
-        models.Email.gmail_message_id == message_id).first()
+    existing = db.query(models.Email).filter(models.Email.gmail_message_id == message_id).first()
     if existing:
         existing.delivery_status = normalized_delivery_status
-        # add any missing interfaces
+        existing.is_read = True
         existing_receivers = {
             iface.receiver.email for iface in existing.interfaces if iface.receiver}
         for r in recipients:
             if r not in existing_receivers:
-                r_user = db.query(models.User).filter(
-                    models.User.email == r).first()
+                r_user = db.query(models.User).filter(models.User.email == r).first()
                 if not r_user:
                     r_user = models.User(email=r, provider="external")
                     db.add(r_user)
@@ -1674,7 +1878,7 @@ def send_email(
     email_record.gmail_message_id = message_id
     email_record.thread_id = thread_id
     email_record.delivery_status = normalized_delivery_status
-
+    email_record.is_read = True
     db.commit()
 
     enqueue_email_analysis(email_record.id)
@@ -1684,7 +1888,6 @@ def send_email(
         "gmail_message_id": message_id,
         "status": "sent",
         "delivery_status": normalized_delivery_status,
-        "attachments_count": len(attachment_list),
     }
 
 
@@ -1697,11 +1900,26 @@ def mark_email_read(
     email = (
         db.query(models.Email)
         .join(models.Interface, models.Interface.email_id == models.Email.id)
-        .filter(models.Email.id == email_id, models.Interface.receiver_id == user.id)
+        .filter(
+            models.Email.id == email_id,
+            or_(
+                models.Interface.receiver_id == user.id,
+                models.Interface.sender_id == user.id,
+            ),
+        )
         .first()
     )
     if not email:
         raise HTTPException(status_code=404, detail="Email not found")
+
+    # Sync current Gmail state into local DB so external changes are reflected
+    if email.gmail_message_id:
+        try:
+            message_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{email.gmail_message_id}"
+            message = _gmail_get_json(user, db, message_url, params={"format": "full"})
+            _sync_existing_email_with_gmail_message(db, email, message, notify_user_id=user.id)
+        except HTTPException as exc:
+            logger.warning("Failed to sync Gmail state for %s: %s", email.gmail_message_id, str(exc.detail))
 
     if email.gmail_message_id:
         _gmail_modify_message_labels(
@@ -1727,29 +1945,133 @@ def mark_email_trash(
     email = (
         db.query(models.Email)
         .join(models.Interface, models.Interface.email_id == models.Email.id)
-        .filter(models.Email.id == email_id, models.Interface.receiver_id == user.id)
+        .filter(
+            models.Email.id == email_id,
+            or_(
+                models.Interface.receiver_id == user.id,
+                models.Interface.sender_id == user.id,
+            ),
+        )
         .first()
     )
     if not email:
         raise HTTPException(status_code=404, detail="Email not found")
 
+    # First, sync current Gmail state so external label changes are reflected locally
     if email.gmail_message_id:
-        if value:
-            _gmail_modify_message_labels(
-                user,
-                db,
-                email.gmail_message_id,
-                add_labels=["TRASH"],
-            )
-        else:
+        try:
+            message_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{email.gmail_message_id}"
+            message = _gmail_get_json(user, db, message_url, params={"format": "full"})
+            _sync_existing_email_with_gmail_message(db, email, message, notify_user_id=user.id)
+        except HTTPException as exc:
+            logger.warning("Failed to sync Gmail state for %s: %s", email.gmail_message_id, str(exc.detail))
+
+    # If request asks to trash the email
+    if value:
+        # If it's already trash locally, perform permanent deletion (Gmail + DB)
+        if email.is_trash:
+            gmail_deleted = False
+            if email.gmail_message_id:
+                try:
+                    _gmail_delete_message(user, db, email.gmail_message_id)
+                    gmail_deleted = True
+                except HTTPException as exc:
+                    detail = str(exc.detail)
+                    if "insufficientPermissions" in detail:
+                        logger.warning(
+                            "Gmail delete failed with insufficient permissions for %s, attempting trash fallback",
+                            email.gmail_message_id,
+                        )
+                        try:
+                            _gmail_trash_message(user, db, email.gmail_message_id)
+                            gmail_deleted = True
+                        except HTTPException:
+                            logger.warning(
+                                "Gmail trash fallback also failed for %s",
+                                email.gmail_message_id,
+                            )
+                    else:
+                        logger.warning(
+                            "Gmail delete failed for %s: %s",
+                            email.gmail_message_id,
+                            detail,
+                        )
+
+            # Remove DB records and attachments
+            attachment_dir = os.path.join(ATTACHMENTS_DIR, str(email.id))
+
+            db.query(models.StaticAnalysis).filter(
+                models.StaticAnalysis.attach_id.in_(
+                    db.query(models.Attachments.id).filter(
+                        models.Attachments.email_id == email.id)
+                )
+            ).delete(synchronize_session=False)
+            db.query(models.DynamicAnalysis).filter(
+                models.DynamicAnalysis.attach_id.in_(
+                    db.query(models.Attachments.id).filter(
+                        models.Attachments.email_id == email.id)
+                )
+            ).delete(synchronize_session=False)
+            db.query(models.AnalysisTask).filter(
+                models.AnalysisTask.email_id == email.id).delete(synchronize_session=False)
+            db.query(models.BodyClassification).filter(
+                models.BodyClassification.email_id == email.id).delete(synchronize_session=False)
+            db.query(models.EmailHeaders).filter(
+                models.EmailHeaders.email_id == email.id).delete(synchronize_session=False)
+            db.query(models.UrlsExtracted).filter(
+                models.UrlsExtracted.email_id == email.id).delete(synchronize_session=False)
+            db.query(models.EmailDeadline).filter(
+                models.EmailDeadline.email_id == email.id).delete(synchronize_session=False)
+            db.query(models.UserAction).filter(models.UserAction.email_id ==
+                                               email.id).delete(synchronize_session=False)
+            db.query(models.EmailLabel).filter(models.EmailLabel.email_id ==
+                                               email.id).delete(synchronize_session=False)
+            db.query(models.Interface).filter(models.Interface.email_id ==
+                                              email.id).delete(synchronize_session=False)
+            db.query(models.Attachments).filter(models.Attachments.email_id ==
+                                                email.id).delete(synchronize_session=False)
+            db.query(models.Email).filter(models.Email.id ==
+                                          email.id).delete(synchronize_session=False)
+            db.commit()
+
+            if os.path.isdir(attachment_dir):
+                shutil.rmtree(attachment_dir, ignore_errors=True)
+
+            return {"email_id": email_id, "deleted": True, "gmail_deleted": gmail_deleted}
+
+        # Otherwise, mark it as trash in Gmail (and locally)
+        if email.gmail_message_id:
+            try:
+                _gmail_trash_message(user, db, email.gmail_message_id)
+            except HTTPException:
+                # Fallback to modifying labels if direct trash fails
+                try:
+                    _gmail_modify_message_labels(
+                        user,
+                        db,
+                        email.gmail_message_id,
+                        add_labels=["TRASH"],
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to mark Gmail message as TRASH: %s", str(exc))
+
+        email.is_trash = True
+        db.commit()
+        return {"email_id": email_id, "is_trash": True}
+
+    # If request asks to un-trash the email, remove TRASH label
+    if email.gmail_message_id:
+        try:
             _gmail_modify_message_labels(
                 user,
                 db,
                 email.gmail_message_id,
                 remove_labels=["TRASH"],
             )
+        except Exception as exc:
+            logger.warning("Failed to remove TRASH label: %s", str(exc))
 
-    email.is_trash = value
+    email.is_trash = False
     db.commit()
 
     return {"email_id": email_id, "is_trash": email.is_trash}
@@ -1765,11 +2087,26 @@ def mark_email_starred(
     email = (
         db.query(models.Email)
         .join(models.Interface, models.Interface.email_id == models.Email.id)
-        .filter(models.Email.id == email_id, models.Interface.receiver_id == user.id)
+        .filter(
+            models.Email.id == email_id,
+            or_(
+                models.Interface.receiver_id == user.id,
+                models.Interface.sender_id == user.id,
+            ),
+        )
         .first()
     )
     if not email:
         raise HTTPException(status_code=404, detail="Email not found")
+
+    # Sync Gmail state first to reflect external changes
+    if email.gmail_message_id:
+        try:
+            message_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{email.gmail_message_id}"
+            message = _gmail_get_json(user, db, message_url, params={"format": "full"})
+            _sync_existing_email_with_gmail_message(db, email, message, notify_user_id=user.id)
+        except HTTPException as exc:
+            logger.warning("Failed to sync Gmail state for %s: %s", email.gmail_message_id, str(exc.detail))
 
     if email.gmail_message_id:
         if value:
@@ -1797,6 +2134,7 @@ def mark_email_starred(
 async def draft_edit(
     email_id: int,
     request: Request,
+    payload: Optional[SendEmailRequest] = Body(None),
     user: models.User = Depends(get_current_user_from_auth),
     db: Session = Depends(get_db),
 ):
@@ -1814,69 +2152,39 @@ async def draft_edit(
             status_code=400, detail="Only draft emails can be edited")
 
     content_type = (request.headers.get("content-type") or "").lower()
+    recipients_raw: Any = None
     subject: Optional[str] = None
     body: Optional[str] = None
-    recipients_raw: Any = None
-    delete_attachment_ids_raw: Any = None
-    new_files: List[UploadFile] = []
+    delivery_status: str = "draft"
 
     if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
         form = await request.form()
+        recipients_raw = form.getlist("recipients") or form.getlist("to")
         subject = form.get("subject")
         body = form.get("body")
-        if "recipients" in form:
-            recipients_raw = form.getlist("recipients")
-        delete_attachment_ids_raw = form.getlist("delete_attachment_ids")
-        if not delete_attachment_ids_raw:
-            delete_attachment_ids_raw = form.get("delete_attachment_ids")
-        new_files = [item for item in form.getlist(
-            "files") if hasattr(item, "filename")]
+        delivery_status = form.get("delivery_status") or "draft"
     else:
-        try:
-            payload = await request.json()
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON")
+        if payload is None:
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+        recipients_raw = payload.recipients
+        subject = payload.subject
+        body = payload.body
+        delivery_status = payload.delivery_status or "draft"
 
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid request body")
-
-        subject = payload.get("subject")
-        body = payload.get("body")
-        recipients_raw = payload.get("recipients")
-        delete_attachment_ids_raw = payload.get("delete_attachment_ids")
-
-    final_subject = email.subject if subject is None else subject
-    final_body = email.body_full if body is None else body
-
-    current_recipients = [
-        iface.receiver.email
-        for iface in email.interfaces
-        if iface.receiver and iface.receiver.email
-    ]
-    final_recipients = current_recipients if recipients_raw is None else _normalize_string_list(
-        recipients_raw)
-
-    if not final_recipients or not isinstance(final_recipients, list):
+    recipients = _normalize_string_list(recipients_raw)
+    if not recipients:
         raise HTTPException(
             status_code=400, detail="recipients must be a non-empty list of email addresses")
 
-    delete_attachment_ids = _normalize_int_list(delete_attachment_ids_raw)
-    existing_attachments = (
-        db.query(models.Attachments)
-        .filter(models.Attachments.email_id == email.id)
-        .all()
-    )
-    attachments_by_id = {
-        attachment.id: attachment for attachment in existing_attachments}
-    missing_attachment_ids = [
-        attachment_id for attachment_id in delete_attachment_ids if attachment_id not in attachments_by_id]
-    if missing_attachment_ids:
-        raise HTTPException(status_code=404, detail="Attachment not found")
+    normalized_delivery_status = delivery_status.strip().lower()
+    if normalized_delivery_status not in {"sent", "draft"}:
+        raise HTTPException(
+            status_code=400, detail='delivery_status must be either "sent" or "draft"')
 
-    email.subject = final_subject or ""
-    email.body_full = final_body or ""
-    email.body_snippet = (final_body or "")[:200]
-    email.delivery_status = "draft"
+    email.subject = subject or email.subject
+    email.body_full = body or email.body_full
+    email.body_snippet = (email.body_full or "")[:200]
+    email.delivery_status = normalized_delivery_status
     email.status = "PENDING"
     email.urls_status = "PENDING"
     email.attachments_status = "PENDING"
@@ -1890,166 +2198,106 @@ async def draft_edit(
     email.final_verdict = None
     email.analyzed_at = None
 
-    attachment_dir = os.path.join(ATTACHMENTS_DIR, str(email.id))
-
-    for attachment_id in delete_attachment_ids:
-        attachment = attachments_by_id[attachment_id]
-        db.query(models.StaticAnalysis).filter(
-            models.StaticAnalysis.attach_id == attachment.id
-        ).delete(synchronize_session=False)
-        db.query(models.DynamicAnalysis).filter(
-            models.DynamicAnalysis.attach_id == attachment.id
-        ).delete(synchronize_session=False)
-        if attachment.file_url and os.path.exists(attachment.file_url):
-            with suppress(OSError):
-                os.remove(attachment.file_url)
-        db.delete(attachment)
-
     db.query(models.EmailHeaders).filter(
         models.EmailHeaders.email_id == email.id).delete(synchronize_session=False)
     db.query(models.UrlsExtracted).filter(
         models.UrlsExtracted.email_id == email.id).delete(synchronize_session=False)
-    db.query(models.BodyClassification).filter(
-        models.BodyClassification.email_id == email.id).delete(synchronize_session=False)
-    db.query(models.AnalysisTask).filter(
-        models.AnalysisTask.email_id == email.id).delete(synchronize_session=False)
     db.query(models.Interface).filter(
         models.Interface.email_id == email.id).delete(synchronize_session=False)
 
     db.add(models.EmailHeaders(email_id=email.id, status="PENDING"))
 
-    urls = extract_urls(final_body or "")
+    urls = extract_urls(email.body_full or "")
     for url in urls:
         db.add(models.UrlsExtracted(email_id=email.id, url=url, status="PENDING"))
 
-    for recipient_email in final_recipients:
+    for recipient_email in recipients:
         recipient_email = str(recipient_email or "").strip()
         if not recipient_email:
             continue
         recipient_user = db.query(models.User).filter(
             models.User.email == recipient_email).first()
         if not recipient_user:
-            recipient_user = models.User(
-                email=recipient_email, provider="external")
+            recipient_user = models.User(email=recipient_email, provider="external")
             db.add(recipient_user)
             db.flush()
         db.add(models.Interface(sender_id=user.id,
                receiver_id=recipient_user.id, email_id=email.id))
 
-    if new_files:
-        os.makedirs(attachment_dir, exist_ok=True)
+    if normalized_delivery_status == "draft":
+        db.commit()
+        return {
+            "email_id": email.id,
+            "status": "draft",
+            "delivery_status": email.delivery_status,
+            "subject": email.subject,
+            "body": email.body_full,
+            "recipients": recipients,
+        }
 
-        for file in new_files:
-            if not file or not file.filename:
-                continue
+    msg = EmailMessage()
+    msg["From"] = user.email
+    msg["To"] = ", ".join(recipients)
+    if email.subject:
+        msg["Subject"] = email.subject
+    msg.set_content(email.body_full or "")
 
-            file_content = file.file.read()
-            attachment_hash = hashlib.sha256(file_content).hexdigest()
-            file_size = len(file_content)
+    raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    send_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+    access_token = _get_valid_google_access_token(user, db)
+    headers = {"Authorization": f"Bearer {access_token}"}
 
-            file_path = os.path.join(attachment_dir, file.filename)
-            with open(file_path, "wb") as f:
-                f.write(file_content)
+    res = requests.post(send_url, headers=headers, json={"raw": raw_b64}, timeout=20)
+    if res.status_code in (401, 403):
+        access_token = _refresh_google_access_token(user, db)
+        headers = {"Authorization": f"Bearer {access_token}"}
+        res = requests.post(send_url, headers=headers, json={"raw": raw_b64}, timeout=20)
 
-            db.add(
-                models.Attachments(
-                    email_id=email.id,
-                    file_name=file.filename,
-                    file_type=file.content_type or "application/octet-stream",
-                    file_size=file_size,
-                    hash_sha256=attachment_hash,
-                    file_url=file_path,
-                    status="PENDING",
-                )
-            )
+    if not res.ok:
+        error_detail = res.text
+        if res.status_code == 403 and "insufficientPermissions" in error_detail:
+            error_detail += " | RESOLUTION: Visit https://myaccount.google.com/permissions, revoke this app, then re-login via /auth/google/login"
+        db.rollback()
+        raise HTTPException(status_code=502, detail=f"Failed to send email: {error_detail}")
 
-    if os.path.isdir(attachment_dir) and not os.listdir(attachment_dir):
-        with suppress(OSError):
-            os.rmdir(attachment_dir)
+    payload = res.json()
+    message_id = payload.get("id")
+    thread_id = payload.get("threadId")
+    if not message_id:
+        db.rollback()
+        raise HTTPException(status_code=502, detail="Gmail did not return message id")
 
+    existing = db.query(models.Email).filter(models.Email.gmail_message_id == message_id).first()
+    if existing and existing.id != email.id:
+        existing.delivery_status = normalized_delivery_status
+        existing.is_read = True
+        existing_receivers = {
+            iface.receiver.email for iface in existing.interfaces if iface.receiver}
+        for r in recipients:
+            if r not in existing_receivers:
+                r_user = db.query(models.User).filter(models.User.email == r).first()
+                if not r_user:
+                    r_user = models.User(email=r, provider="external")
+                    db.add(r_user)
+                    db.flush()
+                db.add(models.Interface(sender_id=user.id,
+                       receiver_id=r_user.id, email_id=existing.id))
+        db.commit()
+        return {"email_id": existing.id, "gmail_message_id": message_id, "status": "exists_updated_receivers"}
+
+    email.gmail_message_id = message_id
+    email.thread_id = thread_id
+    email.is_read = True
     db.commit()
 
-    refreshed_attachments = (
-        db.query(models.Attachments)
-        .filter(models.Attachments.email_id == email.id)
-        .all()
-    )
+    enqueue_email_analysis(email.id)
 
     return {
         "email_id": email.id,
-        "status": "draft",
-        "delivery_status": email.delivery_status,
-        "subject": email.subject,
-        "body": email.body_full,
-        "recipients": final_recipients,
-        "attachments": _serialize_attachments(refreshed_attachments),
+        "gmail_message_id": message_id,
+        "status": "sent",
+        "delivery_status": normalized_delivery_status,
     }
-
-
-@app.delete("/emails/{email_id}", tags = ['emails'])
-def delete_email(
-    email_id: int,
-    user: models.User = Depends(get_current_user_from_auth),
-    db: Session = Depends(get_db),
-):
-    email = (
-        db.query(models.Email)
-        .join(models.Interface, models.Interface.email_id == models.Email.id)
-        .filter(
-            models.Email.id == email_id,
-            or_(
-                models.Interface.receiver_id == user.id,
-                models.Interface.sender_id == user.id,
-            ),
-        )
-        .first()
-    )
-    if not email:
-        raise HTTPException(status_code=404, detail="Email not found")
-
-    if email.gmail_message_id:
-        _gmail_delete_message(user, db, email.gmail_message_id)
-
-    attachment_dir = os.path.join(ATTACHMENTS_DIR, str(email.id))
-
-    db.query(models.StaticAnalysis).filter(
-        models.StaticAnalysis.attach_id.in_(
-            db.query(models.Attachments.id).filter(
-                models.Attachments.email_id == email.id)
-        )
-    ).delete(synchronize_session=False)
-    db.query(models.DynamicAnalysis).filter(
-        models.DynamicAnalysis.attach_id.in_(
-            db.query(models.Attachments.id).filter(
-                models.Attachments.email_id == email.id)
-        )
-    ).delete(synchronize_session=False)
-    db.query(models.AnalysisTask).filter(
-        models.AnalysisTask.email_id == email.id).delete(synchronize_session=False)
-    db.query(models.BodyClassification).filter(
-        models.BodyClassification.email_id == email.id).delete(synchronize_session=False)
-    db.query(models.EmailHeaders).filter(
-        models.EmailHeaders.email_id == email.id).delete(synchronize_session=False)
-    db.query(models.UrlsExtracted).filter(
-        models.UrlsExtracted.email_id == email.id).delete(synchronize_session=False)
-    db.query(models.EmailDeadline).filter(
-        models.EmailDeadline.email_id == email.id).delete(synchronize_session=False)
-    db.query(models.UserAction).filter(models.UserAction.email_id ==
-                                       email.id).delete(synchronize_session=False)
-    db.query(models.EmailLabel).filter(models.EmailLabel.email_id ==
-                                       email.id).delete(synchronize_session=False)
-    db.query(models.Interface).filter(models.Interface.email_id ==
-                                      email.id).delete(synchronize_session=False)
-    db.query(models.Attachments).filter(models.Attachments.email_id ==
-                                        email.id).delete(synchronize_session=False)
-    db.query(models.Email).filter(models.Email.id ==
-                                  email.id).delete(synchronize_session=False)
-    db.commit()
-
-    if os.path.isdir(attachment_dir):
-        shutil.rmtree(attachment_dir, ignore_errors=True)
-
-    return {"email_id": email_id, "deleted": True, "gmail_deleted": True if email.gmail_message_id else False}
 
 
 async def _send_initial_batch(user_id: int, max_results: int = 60) -> None:
