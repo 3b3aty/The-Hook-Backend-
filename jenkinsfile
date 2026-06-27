@@ -130,7 +130,7 @@ pipeline {
 
         stage('Push Image to DockerHub') {
             steps {
-                withCredentials([usernamePassword(credentialsId: REGISTRY_CREDENTIALS_ID, usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                withCredentials([usernamePassword(credentialsId: DOCKERHUB_CREDS, usernameVariable: 'USER', passwordVariable: 'PASS')]) {
                     sh '''
                         echo $PASS | docker login -u $USER --password-stdin
                         docker push ${DOCKERHUB_REPO}:${IMAGE_TAG}
