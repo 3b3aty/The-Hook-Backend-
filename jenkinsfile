@@ -7,8 +7,8 @@ pipeline {
         IMAGE_TAG          = "${env.BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
         GITOPS_REPO        = "git@github.com:Eng-Omar-Hussein/The-Hook-Backend.git"
         GITOPS_DIR         = "k8s"
-        DEFECTDOJO_URL     = "https://defectdojo.yourorg.com"
-        DTRACK_URL         = "https://dtrack.yourorg.com"
+        DEFECTDOJO_URL     = "https://3.92.138.246:8080"
+        DTRACK_URL         = "https://3.92.138.246:8081"
         DTRACK_PROJECT_ID  = credentials('dtrack-project-id')
         DOCKERHUB_CREDS    = credentials('dockerhub-creds')
         DEFECTDOJO_TOKEN   = credentials('defectdojo-api-token')
