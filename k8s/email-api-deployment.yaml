@@ -1,0 +1,172 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: email-api
+  labels:
+    env: development
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: email-config
+  namespace: email-api
+data:
+  # Database
+  DATABASE_URL: "sqlite:///./test.db"
+  
+  # Celery / RabbitMQ
+  CELERY_BROKER_URL: "amqp://guest:guest@rabbitmq-service.email-api.svc.cluster.local:5672//"
+  CELERY_RESULT_BACKEND: "cache+memory://"
+  
+  # Redis
+  REDIS_URL: "redis://redis-service.email-api.svc.cluster.local:6379/0"
+  REDIS_WS_CHANNEL: "ws_updates"
+  
+---
+# Redis Deployment & Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-deployment
+  namespace: email-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+  namespace: email-api
+spec:
+  selector:
+    app: redis
+  ports:
+    - protocol: TCP
+      port: 6379
+      targetPort: 6379
+
+---
+# RabbitMQ Deployment & Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rabbitmq-deployment
+  namespace: email-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      containers:
+      - name: rabbitmq
+        image: rabbitmq:3-management-alpine
+        ports:
+        - containerPort: 5672
+        - containerPort: 15672
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-service
+  namespace: email-api
+spec:
+  selector:
+    app: rabbitmq
+  ports:
+    - name: amqp
+      protocol: TCP
+      port: 5672
+      targetPort: 5672
+    - name: management
+      protocol: TCP
+      port: 15672
+      targetPort: 15672
+
+---
+# FastAPI App Deployment & Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-deployment
+  namespace: email-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: email-api
+  template:
+    metadata:
+      labels:
+        app: email-api
+    spec:
+      containers:
+      - name: email-api
+        image: omarhussein2111/email-api:latest # Update this image name
+        ports:
+        - containerPort: 8000
+        envFrom:
+        - configMapRef:
+            name: email-config
+        - secretRef:
+            name: email-secrets
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+  namespace: email-api
+spec:
+  type: LoadBalancer # Change to ClusterIP if using an Ingress controller
+  selector:
+    app: email-api
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8000
+
+---
+# Celery Worker Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-deployment
+  namespace: email-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: email-worker
+  template:
+    metadata:
+      labels:
+        app: email-worker
+    spec:
+      containers:
+      - name: email-worker
+        image: omarhussein2111/email-api:latest
+        command: ["celery"]
+        args: ["-A", "celery_app", "worker", "--loglevel=info"]
+        envFrom:
+        - configMapRef:
+            name: email-config
+        - secretRef:
+            name: email-secrets
