@@ -1307,7 +1307,10 @@ def get_emails(
     query = (
         db.query(models.Email)
         .join(models.Interface, models.Interface.email_id == models.Email.id)
-        .filter(models.Interface.receiver_id == user.id)
+        .filter(
+            (models.Interface.receiver_id == user.id) |
+            (models.Interface.sender_id == user.id)
+        )
     )
 
     if normalized_status != "all":
@@ -1909,6 +1912,7 @@ async def send_email(
 @app.patch("/emails/{email_id}/read", tags = ['flags'])
 def mark_email_read(
     email_id: int,
+    value: bool = True,
     user: models.User = Depends(get_current_user_from_auth),
     db: Session = Depends(get_db),
 ):
@@ -1937,17 +1941,25 @@ def mark_email_read(
             logger.warning("Failed to sync Gmail state for %s: %s", email.gmail_message_id, str(exc.detail))
 
     if email.gmail_message_id:
-        _gmail_modify_message_labels(
-            user,
-            db,
-            email.gmail_message_id,
-            remove_labels=["UNREAD"],
-        )
+        if value:
+            _gmail_modify_message_labels(
+                user,
+                db,
+                email.gmail_message_id,
+                remove_labels=["UNREAD"],
+            )
+        else:
+            _gmail_modify_message_labels(
+                user,
+                db,
+                email.gmail_message_id,
+                add_labels=["UNREAD"],
+            )
 
-    email.is_read = True
+    email.is_read = value
     db.commit()
 
-    return {"email_id": email_id, "is_read": True}
+    return {"email_id": email_id, "is_read": value}
 
 
 @app.patch("/emails/{email_id}/trash", tags = ['flags'])
