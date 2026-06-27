@@ -613,6 +613,164 @@ def _delete_local_email(db: Session, email: models.Email) -> None:
         shutil.rmtree(attachment_dir, ignore_errors=True)
 
 
+def _create_email_from_gmail_message(
+    user: models.User,
+    db: Session,
+    message: Dict[str, Any],
+    notify_user_id: Optional[int] = None,
+    send_each_email: bool = False,
+) -> Optional[models.Email]:
+    message_id = message.get("id")
+    if not message_id:
+        return None
+
+    payload = message.get("payload", {})
+    headers = payload.get("headers", []) or []
+
+    subject = next(
+        (header.get("value") for header in headers if header.get("name", "").lower() == "subject"),
+        None,
+    )
+    from_header = next(
+        (header.get("value") for header in headers if header.get("name", "").lower() == "from"),
+        "",
+    )
+    to_header = next(
+        (header.get("value") for header in headers if header.get("name", "").lower() == "to"),
+        "",
+    )
+    sender_name, sender_email = parseaddr(from_header)
+    receiver_name, receiver_email = parseaddr(to_header)
+
+    email_date = _parse_email_date(headers, message.get("internalDate"))
+    body_full = extract_body(payload)
+    snippet = message.get("snippet")
+
+    labels = message.get("labelIds") or []
+    category_name = _extract_category_name(labels)
+    category = _get_or_create_category(db, category_name)
+
+    is_starred = "STARRED" in labels
+    is_trash = "TRASH" in labels
+    is_read = "UNREAD" not in labels
+
+    email_record = models.Email(
+        gmail_message_id=message_id,
+        thread_id=message.get("threadId"),
+        subject=subject,
+        body_full=body_full,
+        body_snippet=snippet,
+        labels=None,
+        date=email_date,
+        category_id=category.id,
+        status="PENDING",
+        delivery_status="sent",
+        urls_status="PENDING",
+        attachments_status="PENDING",
+        body_status="PENDING",
+        headers_status="PENDING",
+        is_starred=is_starred,
+        is_trash=is_trash,
+        is_read=is_read,
+    )
+    db.add(email_record)
+    db.flush()
+
+    def _get_or_create_external_user(email_addr: str, display_name: str) -> Optional[models.User]:
+        if not email_addr:
+            return None
+        found = db.query(models.User).filter(models.User.email == email_addr).first()
+        if not found:
+            found = models.User(
+                email=email_addr,
+                name=display_name or None,
+                provider="external",
+            )
+            db.add(found)
+            db.flush()
+        return found
+
+    sender_user = _get_or_create_external_user(sender_email, sender_name)
+    receiver_user = _get_or_create_external_user(receiver_email, receiver_name)
+
+    interface_record = models.Interface(
+        sender_id=sender_user.id if sender_user else None,
+        receiver_id=receiver_user.id if receiver_user else None,
+        email_id=email_record.id,
+    )
+    db.add(interface_record)
+
+    _apply_label_rules_to_email(
+        db,
+        receiver_id=receiver_user.id if receiver_user else None,
+        sender_id=sender_user.id if sender_user else None,
+        email_id=email_record.id,
+    )
+
+    header_info = extract_headers(headers)
+    db.add(
+        models.EmailHeaders(
+            email_id=email_record.id,
+            return_path=header_info.get("return_path"),
+            received_chain=header_info.get("received_chain"),
+            spf_result=header_info.get("spf_result"),
+            dkim_result=header_info.get("dkim_result"),
+            dmarc_result=header_info.get("dmarc_result"),
+            raw_headers=header_info.get("raw_headers"),
+            status="PENDING",
+        )
+    )
+
+    urls = extract_urls(body_full)
+    for url in urls:
+        db.add(models.UrlsExtracted(email_id=email_record.id, url=url, status="PENDING"))
+
+    attachment_meta: List[Dict[str, Any]] = []
+    _collect_attachments(payload, attachment_meta)
+    for attachment in attachment_meta:
+        attachment_hash = None
+        attachment_size = attachment.get("size")
+
+        attachment_id = attachment.get("attachment_id")
+        attachment_url = (
+            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}/attachments/{attachment_id}"
+        )
+        attachment_payload = _gmail_get_json(user, db, attachment_url)
+        attachment_data = attachment_payload.get("data")
+        file_path = None
+        if attachment_data:
+            blob = _decode_base64_url_bytes(attachment_data)
+            attachment_hash = hashlib.sha256(blob).hexdigest()
+            if attachment_size is None:
+                attachment_size = len(blob)
+
+            email_att_dir = os.path.join(ATTACHMENTS_DIR, str(email_record.id))
+            os.makedirs(email_att_dir, exist_ok=True)
+            file_path = os.path.join(email_att_dir, attachment.get("filename", "unknown"))
+            with open(file_path, "wb") as f:
+                f.write(blob)
+
+        db.add(
+            models.Attachments(
+                email_id=email_record.id,
+                file_name=attachment.get("filename"),
+                file_type=attachment.get("mime_type"),
+                file_size=attachment_size,
+                hash_sha256=attachment_hash,
+                file_url=file_path,
+                status="PENDING",
+            )
+        )
+
+    db.commit()
+
+    enqueue_email_analysis(email_record.id)
+    if send_each_email and notify_user_id is not None:
+        _send_email_received(db, notify_user_id, email_record)
+
+    return email_record
+
+
 def _sync_gmail_message_state(
     user: models.User,
     db: Session,
@@ -623,18 +781,24 @@ def _sync_gmail_message_state(
     if not message_id:
         return False
 
-    existing = db.query(models.Email).filter(
-        models.Email.gmail_message_id == message_id).first()
-    if not existing:
-        return False
-
-    if message.get("labelIds") is None:
+    if message.get("labelIds") is None or not message.get("payload"):
         message_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}"
         message = _gmail_get_json(user, db, message_url, params={"format": "full"})
 
-    return _sync_existing_email_with_gmail_message(
-        db, existing, message, notify_user_id=notify_user_id
+    existing = db.query(models.Email).filter(models.Email.gmail_message_id == message_id).first()
+    if existing:
+        return _sync_existing_email_with_gmail_message(
+            db, existing, message, notify_user_id=notify_user_id
+        )
+
+    created = _create_email_from_gmail_message(
+        user,
+        db,
+        message,
+        notify_user_id=notify_user_id,
+        send_each_email=True,
     )
+    return created is not None
 
 
 def _process_gmail_history_records(
@@ -1218,164 +1382,15 @@ def _fetch_and_store_emails_for_user(
                 skipped += 1
             continue
 
-        payload = message.get("payload", {})
-        headers = payload.get("headers", []) or []
-
-        subject = next(
-            (header.get("value")
-             for header in headers if header.get("name", "").lower() == "subject"),
-            None,
-        )
-        from_header = next(
-            (header.get("value")
-             for header in headers if header.get("name", "").lower() == "from"),
-            "",
-        )
-        to_header = next(
-            (header.get("value")
-             for header in headers if header.get("name", "").lower() == "to"),
-            "",
-        )
-        sender_name, sender_email = parseaddr(from_header)
-        receiver_name, receiver_email = parseaddr(to_header)
-
-        email_date = _parse_email_date(headers, message.get("internalDate"))
-        body_full = extract_body(payload)
-        snippet = message.get("snippet")
-
-        labels = message.get("labelIds") or []
-        category_name = _extract_category_name(labels)
-        category = _get_or_create_category(db, category_name)
-
-        is_starred = "STARRED" in labels
-        is_trash = "TRASH" in labels
-        is_read = "UNREAD" not in labels
-
-        email_record = models.Email(
-            gmail_message_id=message_id,
-            thread_id=message.get("threadId"),
-            subject=subject,
-            body_full=body_full,
-            body_snippet=snippet,
-            labels=None,
-            date=email_date,
-            category_id=category.id,
-            status="PENDING",
-            delivery_status="sent",
-            urls_status="PENDING",
-            attachments_status="PENDING",
-            body_status="PENDING",
-            headers_status="PENDING",
-            is_starred=is_starred,
-            is_trash=is_trash,
-            is_read=is_read,
-        )
-        db.add(email_record)
-        db.flush()
-
-        def _get_or_create_external_user(email_addr: str, display_name: str) -> Optional[models.User]:
-            if not email_addr:
-                return None
-            found = db.query(models.User).filter(
-                models.User.email == email_addr).first()
-            if not found:
-                found = models.User(
-                    email=email_addr,
-                    name=display_name or None,
-                    provider="external",
-                )
-                db.add(found)
-                db.flush()
-            return found
-
-        sender_user = _get_or_create_external_user(sender_email, sender_name)
-        receiver_user = _get_or_create_external_user(
-            receiver_email, receiver_name)
-
-        interface_record = models.Interface(
-            sender_id=sender_user.id if sender_user else None,
-            receiver_id=receiver_user.id if receiver_user else None,
-            email_id=email_record.id,
-        )
-        db.add(interface_record)
-
-        _apply_label_rules_to_email(
+        created_email = _create_email_from_gmail_message(
+            user,
             db,
-            receiver_id=receiver_user.id if receiver_user else None,
-            sender_id=sender_user.id if sender_user else None,
-            email_id=email_record.id,
+            message,
+            notify_user_id=notify_user_id,
+            send_each_email=send_each_email,
         )
-
-        header_info = extract_headers(headers)
-        header_record = models.EmailHeaders(
-            email_id=email_record.id,
-            return_path=header_info.get("return_path"),
-            received_chain=header_info.get("received_chain"),
-            spf_result=header_info.get("spf_result"),
-            dkim_result=header_info.get("dkim_result"),
-            dmarc_result=header_info.get("dmarc_result"),
-            raw_headers=header_info.get("raw_headers"),
-            status="PENDING",
-        )
-        db.add(header_record)
-
-        urls = extract_urls(body_full)
-        for url in urls:
-            db.add(
-                models.UrlsExtracted(
-                    email_id=email_record.id,
-                    url=url,
-                    status="PENDING",
-                )
-            )
-
-        attachment_meta: List[Dict[str, Any]] = []
-        _collect_attachments(payload, attachment_meta)
-        for attachment in attachment_meta:
-            attachment_hash = None
-            attachment_size = attachment.get("size")
-
-            attachment_id = attachment.get("attachment_id")
-            attachment_url = (
-                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}/attachments/{attachment_id}"
-            )
-            attachment_payload = _gmail_get_json(user, db, attachment_url)
-            attachment_data = attachment_payload.get("data")
-            file_path = None
-            if attachment_data:
-                blob = _decode_base64_url_bytes(attachment_data)
-                attachment_hash = hashlib.sha256(blob).hexdigest()
-                if attachment_size is None:
-                    attachment_size = len(blob)
-
-                # Save attachment bytes to disk for later analysis
-                email_att_dir = os.path.join(
-                    ATTACHMENTS_DIR, str(email_record.id))
-                os.makedirs(email_att_dir, exist_ok=True)
-                file_path = os.path.join(
-                    email_att_dir, attachment.get("filename", "unknown"))
-                with open(file_path, "wb") as f:
-                    f.write(blob)
-
-            db.add(
-                models.Attachments(
-                    email_id=email_record.id,
-                    file_name=attachment.get("filename"),
-                    file_type=attachment.get("mime_type"),
-                    file_size=attachment_size,
-                    hash_sha256=attachment_hash,
-                    file_url=file_path,
-                    status="PENDING",
-                )
-            )
-
-        email_id = email_record.id
-        db.commit()
-
-        enqueue_email_analysis(email_id)
-        if send_each_email and notify_user_id is not None:
-            _send_email_received(db, notify_user_id, email_record)
-        stored += 1
+        if created_email is not None:
+            stored += 1
 
     user.last_email_sync = datetime.now(timezone.utc)
     db.commit()
