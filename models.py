@@ -41,20 +41,30 @@ class User(Base):
 
     last_login = Column(DateTime, nullable=True)
     last_email_sync = Column(DateTime, nullable=True)
+    last_history_id = Column(String, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    interface_sender = relationship("Interface", back_populates="sender", foreign_keys="Interface.sender_id")
-    interface_receivers = relationship("Interface", back_populates="receiver", foreign_keys="Interface.receiver_id")
+    interface_sender = relationship(
+        "Interface", back_populates="sender", foreign_keys="Interface.sender_id")
+    interface_receivers = relationship(
+        "Interface", back_populates="receiver", foreign_keys="Interface.receiver_id")
+    labels = relationship("Label", back_populates="user")
+    label_rules = relationship(
+        "LabelRule", back_populates="user", foreign_keys="LabelRule.user_id")
+    sent_label_rules = relationship(
+        "LabelRule", back_populates="from_user", foreign_keys="LabelRule.from_user_id")
 
 # =========================
 # EMAIL
 # =========================
+
+
 class Email(Base):
     __tablename__ = 'emails'
 
     id = Column(Integer, primary_key=True, index=True)
-    gmail_message_id = Column(String, unique=True, index=True)  
+    gmail_message_id = Column(String, unique=True, index=True)
     thread_id = Column(String, index=True)
 
     subject = Column(String)
@@ -63,10 +73,13 @@ class Email(Base):
     labels = Column(Text, nullable=True)
     date = Column(DateTime)
 
+    delivery_status = Column(String, default="draft")
+
     category_id = Column(Integer, ForeignKey('categories.id'), nullable=True)
 
     # GLOBAL STATUS
-    status = Column(String, default="PENDING")  # PENDING, PROCESSING, ANALYZED, FAILED
+    # PENDING, PROCESSING, ANALYZED, FAILED
+    status = Column(String, default="PENDING")
     is_read = Column(Boolean, default=False)
     is_hooked = Column(Boolean, default=False)
     is_trash = Column(Boolean, default=False)
@@ -98,12 +111,69 @@ class Email(Base):
     interfaces = relationship("Interface", back_populates="email")
     deadlines = relationship("EmailDeadline", back_populates="email")
 
-    headers = relationship("EmailHeaders", back_populates="email", uselist=False)
+    headers = relationship(
+        "EmailHeaders", back_populates="email", uselist=False)
     urls = relationship("UrlsExtracted", back_populates="email")
     attachments = relationship("Attachments", back_populates="email")
+    email_labels = relationship("EmailLabel", back_populates="email")
 
     user_actions = relationship("UserAction", back_populates="email")
-    body_classification = relationship("BodyClassification", back_populates="email", uselist=False)
+    body_classification = relationship(
+        "BodyClassification", back_populates="email", uselist=False)
+
+
+# =========================
+# LABELS
+# =========================
+class Label(Base):
+    __tablename__ = 'labels'
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'),
+                     nullable=False, index=True)
+    name = Column(String, nullable=False)
+    color = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="labels")
+    rules = relationship("LabelRule", back_populates="label")
+    emails = relationship("EmailLabel", back_populates="label")
+
+
+# =========================
+# LABEL RULES
+# =========================
+class LabelRule(Base):
+    __tablename__ = 'label_rules'
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'),
+                     nullable=False, index=True)
+    label_id = Column(Integer, ForeignKey('labels.id'),
+                      nullable=False, index=True)
+    from_user_id = Column(Integer, ForeignKey(
+        'users.id'), nullable=False, index=True)
+
+    user = relationship("User", back_populates="label_rules",
+                        foreign_keys=[user_id])
+    label = relationship("Label", back_populates="rules")
+    from_user = relationship(
+        "User", back_populates="sent_label_rules", foreign_keys=[from_user_id])
+
+
+# =========================
+# EMAIL LABELS
+# =========================
+class EmailLabel(Base):
+    __tablename__ = 'email_labels'
+
+    email_id = Column(Integer, ForeignKey('emails.id'),
+                      primary_key=True, nullable=False)
+    label_id = Column(Integer, ForeignKey('labels.id'),
+                      primary_key=True, nullable=False)
+
+    email = relationship("Email", back_populates="email_labels")
+    label = relationship("Label", back_populates="emails")
 
 
 # =========================
@@ -119,8 +189,10 @@ class Interface(Base):
     email_id = Column(Integer, ForeignKey('emails.id'))
 
     email = relationship("Email", back_populates="interfaces")
-    sender = relationship("User", back_populates="interface_sender", foreign_keys=[sender_id])
-    receiver = relationship("User", back_populates="interface_receivers", foreign_keys=[receiver_id])
+    sender = relationship(
+        "User", back_populates="interface_sender", foreign_keys=[sender_id])
+    receiver = relationship(
+        "User", back_populates="interface_receivers", foreign_keys=[receiver_id])
 
 
 # =========================
@@ -157,7 +229,8 @@ class UrlsExtracted(Base):
     __tablename__ = 'urls_extracted'
 
     id = Column(Integer, primary_key=True, index=True)
-    email_id = Column(Integer, ForeignKey('emails.id'), nullable=False, index=True)
+    email_id = Column(Integer, ForeignKey('emails.id'),
+                      nullable=False, index=True)
 
     url = Column(String, nullable=False)
 
@@ -177,7 +250,8 @@ class Attachments(Base):
     __tablename__ = 'attachments'
 
     id = Column(Integer, primary_key=True, index=True)
-    email_id = Column(Integer, ForeignKey('emails.id'), nullable=False, index=True)
+    email_id = Column(Integer, ForeignKey('emails.id'),
+                      nullable=False, index=True)
 
     file_name = Column(String, nullable=False)
     file_url = Column(String, nullable=True)
@@ -190,8 +264,10 @@ class Attachments(Base):
 
     email = relationship("Email", back_populates="attachments")
 
-    static_analysis = relationship("StaticAnalysis", back_populates="attachment", uselist=False)
-    dynamic_analysis = relationship("DynamicAnalysis", back_populates="attachment", uselist=False)
+    static_analysis = relationship(
+        "StaticAnalysis", back_populates="attachment", uselist=False)
+    dynamic_analysis = relationship(
+        "DynamicAnalysis", back_populates="attachment", uselist=False)
 
 
 # =========================
@@ -201,7 +277,8 @@ class StaticAnalysis(Base):
     __tablename__ = 'static_analysis'
 
     id = Column(Integer, primary_key=True, index=True)
-    attach_id = Column(Integer, ForeignKey('attachments.id'), unique=True, nullable=False)
+    attach_id = Column(Integer, ForeignKey(
+        'attachments.id'), unique=True, nullable=False)
 
     score = Column(Float, nullable=True)
     reasons = Column(JSON, nullable=True)
@@ -217,7 +294,8 @@ class DynamicAnalysis(Base):
     __tablename__ = 'dynamic_analysis'
 
     id = Column(Integer, primary_key=True, index=True)
-    attach_id = Column(Integer, ForeignKey('attachments.id'), unique=True, nullable=False)
+    attach_id = Column(Integer, ForeignKey(
+        'attachments.id'), unique=True, nullable=False)
 
     score = Column(Float, nullable=True)
     reasons = Column(JSON, nullable=True)
@@ -233,7 +311,8 @@ class BodyClassification(Base):
     __tablename__ = 'body_classification'
 
     id = Column(Integer, primary_key=True, index=True)
-    email_id = Column(Integer, ForeignKey('emails.id'), unique=True, nullable=False, index=True)
+    email_id = Column(Integer, ForeignKey('emails.id'),
+                      unique=True, nullable=False, index=True)
 
     confidence = Column(Float, nullable=True)
     verdict = Column(String, nullable=True)
