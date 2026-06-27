@@ -1,0 +1,256 @@
+pipeline {
+    agent any
+
+    environment {
+        APP_NAME           = "email-api"
+        DOCKERHUB_REPO     = "omarhussein2111/email-api"
+        IMAGE_TAG          = "${env.BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
+        GITOPS_REPO        = "git@github.com:Eng-Omar-Hussein/The-Hook-Backend.git"
+        GITOPS_DIR         = "k8s"
+        DEFECTDOJO_URL     = "https://defectdojo.yourorg.com"
+        DTRACK_URL         = "https://dtrack.yourorg.com"
+        DTRACK_PROJECT_ID  = credentials('dtrack-project-id')
+        DOCKERHUB_CREDS    = credentials('dockerhub-creds')
+        DEFECTDOJO_TOKEN   = credentials('defectdojo-api-token')
+        DTRACK_API_KEY     = credentials('dtrack-api-key')
+        EMAIL_RECIPIENTS   = "omarhussein2111@gmail.com"
+        ZAP_TARGET_URL     = "http://staging.fastapi.local:8000"
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 45, unit: 'MINUTES')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script { GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim() }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh "docker build -t ${DOCKERHUB_REPO}:${IMAGE_TAG} -t ${DOCKERHUB_REPO}:latest ."
+            }
+        }
+
+        stage('Install Deps') {
+            steps {
+                sh '''
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install -r requirements.txt
+                '''
+            }
+        }
+
+        stage('SAST - Semgrep') {
+            steps {
+                sh '''
+                    pip install semgrep --break-system-packages || true
+                    semgrep --config=p/owasp-top-ten --config=p/security-audit \
+                        --json --output=semgrep-report.json . || true
+                '''
+            }
+            post {
+                always { archiveArtifacts artifacts: 'semgrep-report.json', allowEmptyArchive: true }
+            }
+        }
+
+        stage('SAST - Bandit') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    pip install bandit
+                    bandit -r . -f json -o bandit-report.json -ll || true
+                '''
+            }
+            post {
+                always { archiveArtifacts artifacts: 'bandit-report.json', allowEmptyArchive: true }
+            }
+        }
+
+        stage('Secrets Scan - Gitleaks') {
+            steps {
+                sh '''
+                    docker run --rm -v "$PWD":/repo zricethezav/gitleaks:latest \
+                        detect --source=/repo --report-format=json \
+                        --report-path=/repo/gitleaks-report.json --no-git || true
+                '''
+            }
+            post {
+                always { archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true }
+            }
+        }
+
+        stage('Gate: Critical Secrets Found?') {
+            steps {
+                script {
+                    def leaks = readJSON file: 'gitleaks-report.json' ?: '[]'
+                    if (leaks && leaks.size() > 0) {
+                        echo "WARNING: ${leaks.size()} potential secrets found. Review report."
+                        // Uncomment to hard-fail the build:
+                        // error("Secrets detected - failing pipeline")
+                    }
+                }
+            }
+        }
+
+        stage('SBOM - CycloneDX') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    pip install cyclonedx-bom
+                    cyclonedx-py environment -o sbom.json --format json
+                '''
+            }
+            post {
+                always { archiveArtifacts artifacts: 'sbom.json', allowEmptyArchive: true }
+            }
+        }
+
+        stage('Scan - Trivy (Image + FS + SBOM)') {
+            steps {
+                sh '''
+                    trivy fs --format json --output trivy-fs-report.json . || true
+                    trivy image --format json --output trivy-image-report.json ${DOCKERHUB_REPO}:${IMAGE_TAG} || true
+                    trivy sbom --format json --output trivy-sbom-report.json sbom.json || true
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-*-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Push Image to DockerHub') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: REGISTRY_CREDENTIALS_ID, usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                    sh '''
+                        echo $PASS | docker login -u $USER --password-stdin
+                        docker push ${DOCKERHUB_REPO}:${IMAGE_TAG}
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Staging (for DAST)') {
+            steps {
+                sh '''
+                    docker rm -f fastapi-staging || true
+                    docker run -d --name fastapi-staging -p 8000:8000 ${DOCKERHUB_REPO}:${IMAGE_TAG}
+                    sleep 10
+                '''
+            }
+        }
+
+        stage('DAST - OWASP ZAP') {
+            steps {
+                sh '''
+                    docker run --rm --network host -v "$PWD":/zap/wrk/:rw \
+                        zaproxy/zap-stable zap-baseline.py \
+                        -t ${ZAP_TARGET_URL} \
+                        -J zap-report.json -r zap-report.html || true
+                '''
+            }
+            post {
+                always {
+                    sh 'docker rm -f fastapi-staging || true'
+                    archiveArtifacts artifacts: 'zap-report.*', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Upload Reports to DefectDojo') {
+            steps {
+                script {
+                    def reports = [
+                        [file: 'semgrep-report.json', type: 'Semgrep JSON Report'],
+                        [file: 'bandit-report.json',  type: 'Bandit Scan'],
+                        [file: 'gitleaks-report.json',type: 'Gitleaks Scan'],
+                        [file: 'trivy-image-report.json', type: 'Trivy Scan'],
+                        [file: 'trivy-fs-report.json', type: 'Trivy Scan'],
+                        [file: 'zap-report.json', type: 'ZAP Scan']
+                    ]
+                    reports.each { r ->
+                        sh """
+                            curl -s -X POST ${DEFECTDOJO_URL}/api/v2/import-scan/ \
+                            -H "Authorization: Token ${DEFECTDOJO_TOKEN}" \
+                            -F "scan_type=${r.type}" \
+                            -F "file=@${r.file}" \
+                            -F "engagement=1" \
+                            -F "active=true" \
+                            -F "verified=false" || true
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Upload SBOM to Dependency-Track') {
+            steps {
+                sh """
+                    curl -s -X POST "${DTRACK_URL}/api/v1/bom" \
+                    -H "X-Api-Key: ${DTRACK_API_KEY}" \
+                    -F "project=${DTRACK_PROJECT_ID}" \
+                    -F "bom=@sbom.json" || true
+                """
+            }
+        }
+
+        stage('CD - Update GitOps Repo for ArgoCD') {
+            steps {
+                sshagent(credentials: ['github-ssh-key']) {
+                        // rm -rf ${GITOPS_DIR}
+                        // git clone ${GITOPS_REPO} ${GITOPS_DIR}
+                        // cd ${GITOPS_DIR}
+                    sh """
+                        # Update image tag inside the app's ConfigMap/deployment manifest
+                        # yq e -i '.data.IMAGE_TAG = "${IMAGE_TAG}"' apps/${APP_NAME}/configmap.yaml
+                        sed -i -E "s|(^[[:space:]]*image: )omarhussein2111/.*|\1${DOCKERHUB_REPO}:${IMAGE_TAG}|g" k8s/deployment.yaml
+
+                        git config user.email "omarhussein2111@gmail.com"
+                        git config user.name "Eng-Omar-Hussein"
+                        git add .
+                        git commit -m "ci: bump ${APP_NAME} image to ${IMAGE_TAG}"
+                        git push origin main
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            emailext(
+                subject: "[CI Security] ${APP_NAME} build #${BUILD_NUMBER} - ${currentBuild.currentResult}",
+                body: """
+                    Pipeline: ${JOB_NAME} #${BUILD_NUMBER}
+                    Image: ${DOCKERHUB_REPO}:${IMAGE_TAG}
+                    Status: ${currentBuild.currentResult}
+
+                    Reports: DefectDojo, Dependency-Track, and Jenkins artifacts.
+                    See: ${BUILD_URL}
+                """,
+                to: "${EMAIL_RECIPIENTS}",
+                attachmentsPattern: 'semgrep-report.json,bandit-report.json,gitleaks-report.json,trivy-*-report.json,zap-report.html,sbom.json'
+            )
+        }
+        always {
+            sh 'docker logout || true'
+            cleanWs()
+        }
+        failure {
+            emailext(
+                subject: "[CI FAILED] ${APP_NAME} build #${BUILD_NUMBER}",
+                body: "Pipeline failed. Check: ${BUILD_URL}",
+                to: "${EMAIL_RECIPIENTS}"
+            )
+        }
+    }
+}
