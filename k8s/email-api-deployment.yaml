@@ -12,8 +12,7 @@ metadata:
   name: email-config
   namespace: email-api
 data:
-  GOOGLE_REDIRECT_URI: "https://0.0.0.0/auth/google/callback"
-
+  GOOGLE_REDIRECT_URI: "http://a43cfcf1b763b45aab8b4a3e0c0488d1-1595724463.us-east-1.elb.amazonaws.com:8080/auth/google/callback"
   # Database
   DATABASE_URL: "sqlite:///./test.db"
   
