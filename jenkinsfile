@@ -4,17 +4,16 @@ pipeline {
     environment {
         APP_NAME           = "email-api"
         DOCKERHUB_REPO     = "omarhussein2111/email-api"
-        IMAGE_TAG          = "${env.BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
         GITOPS_REPO        = "git@github.com:Eng-Omar-Hussein/The-Hook-Backend.git"
         GITOPS_DIR         = "k8s"
-        DEFECTDOJO_URL     = "http://3.92.138.246:8080"
-        DTRACK_URL         = "http://3.92.138.246:8081"
+        DEFECTDOJO_URL     = "http://54.164.24.188:8080"
+        DTRACK_URL         = "http://54.164.24.188:8081"
         DTRACK_PROJECT_ID  = credentials('dtrack-project-id')
         DOCKERHUB_CREDS    = credentials('dockerhub-creds')
         DEFECTDOJO_TOKEN   = credentials('defectdojo-api-token')
         DTRACK_API_KEY     = credentials('dtrack-api-key')
         EMAIL_RECIPIENTS   = "omarhussein2111@gmail.com"
-        ZAP_TARGET_URL     = "http://staging.fastapi.local:8000"
+        ZAP_TARGET_URL     = "http://localhost:8000"
     }
 
     options {
@@ -105,7 +104,7 @@ pipeline {
                 sh '''
                     . venv/bin/activate
                     pip install cyclonedx-bom
-                    cyclonedx-py environment -o sbom.json --format json
+                    cyclonedx-py environment -o sbom.json --output-format json
                 '''
             }
             post {
@@ -116,6 +115,8 @@ pipeline {
         stage('Scan - Trivy (Image + FS + SBOM)') {
             steps {
                 sh '''
+                    . venv/bin/activate
+                    pip install trivy --break-system-packages || true
                     trivy fs --format json --output trivy-fs-report.json . || true
                     trivy image --format json --output trivy-image-report.json ${DOCKERHUB_REPO}:${IMAGE_TAG} || true
                     trivy sbom --format json --output trivy-sbom-report.json sbom.json || true
@@ -130,21 +131,28 @@ pipeline {
 
         stage('Push Image to DockerHub') {
             steps {
-                withCredentials([usernamePassword(credentialsId: DOCKERHUB_CREDS, usernameVariable: 'USER', passwordVariable: 'PASS')]) {
-                    sh '''
-                        echo $PASS | docker login -u $USER --password-stdin
-                        docker push ${DOCKERHUB_REPO}:${IMAGE_TAG}
-                    '''
-                }
+                sh '''
+                    echo "$DOCKERHUB_CREDS_PSW" | docker login -u "$DOCKERHUB_CREDS_USR" --password-stdin
+                    docker push ${DOCKERHUB_REPO}:${IMAGE_TAG}
+                    docker push ${DOCKERHUB_REPO}:latest
+                '''
             }
         }
 
         stage('Deploy to Staging (for DAST)') {
             steps {
                 sh '''
-                    docker rm -f fastapi-staging || true
-                    docker run -d --name fastapi-staging -p 8000:8000 ${DOCKERHUB_REPO}:${IMAGE_TAG}
-                    sleep 10
+                    docker rm -f fastapi02-staging || true
+                    docker run -d --name fastapi02-staging -p 8000:8000 ${DOCKERHUB_REPO}:${IMAGE_TAG}
+
+                    for i in $(seq 1 20); do
+                        if curl -sf http://localhost:8000/docs > /dev/null 2>&1; then
+                            echo "App is ready"
+                            break
+                        fi
+                        echo "Waiting for app... ($i/20)"
+                        sleep 3
+                    done
                 '''
             }
         }
@@ -160,8 +168,52 @@ pipeline {
             }
             post {
                 always {
-                    sh 'docker rm -f fastapi-staging || true'
+                    sh 'docker rm -f fastapi02-staging || true'
                     archiveArtifacts artifacts: 'zap-report.*', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Ensure DefectDojo Product/Engagement') {
+            steps {
+                script {
+                    // Check if product exists, else create it
+                    def productSearch = sh(
+                        script: """
+                            curl -s -H "Authorization: Token ${DEFECTDOJO_TOKEN}" \
+                            "${DEFECTDOJO_URL}/api/v2/products/?name=${APP_NAME}"
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    def productJson = readJSON text: productSearch
+                    def productId
+
+                    if (productJson.count == 0) {
+                        def createProduct = sh(
+                            script: """
+                                curl -s -X POST "${DEFECTDOJO_URL}/api/v2/products/" \
+                                -H "Authorization: Token ${DEFECTDOJO_TOKEN}" \
+                                -H "Content-Type: application/json" \
+                                -d '{"name": "${APP_NAME}", "description": "CI pipeline product", "prod_type": 1}'
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        productId = readJSON(text: createProduct).id
+                    } else {
+                        productId = productJson.results[0].id
+                    }
+
+                    // Check if engagement exists for this build, else create it
+                    def createEngagement = sh(
+                        script: """
+                            curl -s -X POST "${DEFECTDOJO_URL}/api/v2/engagements/" \
+                            -H "Authorization: Token ${DEFECTDOJO_TOKEN}" \
+                            -H "Content-Type: application/json" \
+                            -d '{"name": "Build-${BUILD_NUMBER}", "product": ${productId}, "target_start": "${new Date().format('yyyy-MM-dd')}", "target_end": "${new Date().format('yyyy-MM-dd')}", "status": "In Progress"}'
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    env.DD_ENGAGEMENT_ID = readJSON(text: createEngagement).id
                 }
             }
         }
@@ -183,7 +235,7 @@ pipeline {
                             -H "Authorization: Token ${DEFECTDOJO_TOKEN}" \
                             -F "scan_type=${r.type}" \
                             -F "file=@${r.file}" \
-                            -F "engagement=1" \
+                            -F "engagement=${env.DD_ENGAGEMENT_ID}" \
                             -F "active=true" \
                             -F "verified=false" || true
                         """
@@ -212,13 +264,13 @@ pipeline {
                     sh """
                         # Update image tag inside the app's ConfigMap/deployment manifest
                         # yq e -i '.data.IMAGE_TAG = "${IMAGE_TAG}"' apps/${APP_NAME}/configmap.yaml
-                        sed -i -E "s|(^[[:space:]]*image: )omarhussein2111/.*|\1${DOCKERHUB_REPO}:${IMAGE_TAG}|g" k8s/deployment.yaml
+                        sed -i -E "s|(^[[:space:]]*image: )omarhussein2111/.*|\1${DOCKERHUB_REPO}:${IMAGE_TAG}|g" ${GITOPS_DIR}/email-api-deployment.yaml
 
                         git config user.email "omarhussein2111@gmail.com"
                         git config user.name "Eng-Omar-Hussein"
-                        git add .
-                        git commit -m "ci: bump ${APP_NAME} image to ${IMAGE_TAG}"
-                        git push origin main
+                        git add ${GITOPS_DIR}/email-api-deployment.yaml
+                        git commit -m "ci: bump ${APP_NAME} image to ${IMAGE_TAG}" || echo "No changes to commit"
+                        git push origin HEAD:main
                     """
                 }
             }
