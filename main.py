@@ -2163,7 +2163,7 @@ def mark_email_starred(
     return {"email_id": email_id, "is_starred": email.is_starred}
 
 
-@app.patch("/emails/{email_id}/verdict", tags = ['emails'])
+@app.patch("/emails/{email_id}/verdict", tags = ['flags'])
 def update_email_verdict(
     email_id: int,
     action: VerdictActionRequest = Body(...),
