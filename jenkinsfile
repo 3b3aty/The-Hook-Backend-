@@ -53,7 +53,7 @@ pipeline {
         stage('SAST - Semgrep') {
             steps {
                 sh '''
-                    pip install semgrep --break-system-packages || true
+                    pip install semgrep  || true
                     semgrep --config=p/owasp-top-ten --config=p/security-audit \
                         --json --output=semgrep-report.json . || true
                 '''
@@ -119,7 +119,7 @@ pipeline {
             steps {
                 sh '''
                     . venv/bin/activate
-                    pip install trivy --break-system-packages || true
+                    pip install trivy  || true
                     trivy fs --format json --output trivy-fs-report.json . || true
                     trivy image --format json --output trivy-image-report.json ${DOCKERHUB_REPO}:${IMAGE_TAG} || true
                     trivy sbom --format json --output trivy-sbom-report.json sbom.json || true
