@@ -27,7 +27,10 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scm
-                script { GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim() }
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
+                }
             }
         }
 
