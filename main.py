@@ -983,6 +983,7 @@ def _serialize_email(email: models.Email) -> Dict[str, Any]:
         "delivery_status": email.delivery_status,
         "risk_score": email.risk_score,
         "final_verdict": email.final_verdict,
+        "user_act": email.user_act,
         "urls_status": email.urls_status,
         "body_status": email.body_status,
         "headers_status": email.headers_status,
@@ -1277,6 +1278,11 @@ class SendEmailRequest(BaseModel):
         "draft",
         description='Email send state: "draft" or "sent"',
     )
+
+
+class VerdictActionRequest(BaseModel):
+    state: str = Field(..., description="Target state for the user action")
+    reason: str = Field(..., description="Reason for the user action")
 
 
 def _normalize_int_list(value: Any) -> List[int]:
@@ -2155,6 +2161,48 @@ def mark_email_starred(
     db.commit()
 
     return {"email_id": email_id, "is_starred": email.is_starred}
+
+
+@app.patch("/emails/{email_id}/verdict", tags = ['emails'])
+def update_email_verdict(
+    email_id: int,
+    action: VerdictActionRequest = Body(...),
+    user: models.User = Depends(get_current_user_from_auth),
+    db: Session = Depends(get_db),
+):
+    email = (
+        db.query(models.Email)
+        .join(models.Interface, models.Interface.email_id == models.Email.id)
+        .filter(
+            models.Email.id == email_id,
+            or_(
+                models.Interface.receiver_id == user.id,
+                models.Interface.sender_id == user.id,
+            ),
+        )
+        .first()
+    )
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    from_state = email.user_act or email.final_verdict or ""
+    user_action = models.UserAction(
+        email_id=email.id,
+        from_action=from_state,
+        to_action=action.state,
+        reasons=action.reason,
+    )
+    db.add(user_action)
+    email.user_act = action.state
+    db.commit()
+
+    return {
+        "email_id": email.id,
+        "from_state": from_state,
+        "to_action": action.state,
+        "reasons": action.reason,
+        "user_act": email.user_act,
+    }
 
 
 @app.patch("/emails/{email_id}/draft_edit", tags = ['emails'])

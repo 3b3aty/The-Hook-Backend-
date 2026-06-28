@@ -100,6 +100,7 @@ class Email(Base):
     # FINAL RESULT
     risk_score = Column(Float, default=0.0)
     final_verdict = Column(String, nullable=True)
+    user_act = Column(String, nullable=True)
 
     # TIMESTAMPS
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -347,7 +348,9 @@ class UserAction(Base):
     id = Column(Integer, primary_key=True, index=True)
     email_id = Column(Integer, ForeignKey('emails.id'), nullable=False)
 
-    action = Column(String, nullable=False)
+    from_action = Column(String, nullable=False)
+    to_action = Column(String, nullable=False)
+    reasons = Column(String, nullable=True)
     time_stamp = Column(DateTime(timezone=True), server_default=func.now())
 
     email = relationship("Email", back_populates="user_actions")

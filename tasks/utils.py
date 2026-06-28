@@ -334,6 +334,8 @@ def maybe_finalize_email(db, email: models.Email) -> Optional[Dict[str, Any]]:
         email.status = "ANALYZED"
         email.risk_score = risk_score
         email.final_verdict = final_verdict
+        if email.user_act is None:
+            email.user_act = final_verdict
         email.is_hooked = final_verdict == "PHISHING"
         email.analyzed_at = datetime.now(timezone.utc)
         category_name = email.category.name if email.category else None

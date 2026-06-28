@@ -37,3 +37,6 @@ Thumbs.db
 # Build artifacts
 build/
 dist/
+
+# Build artifacts
+attachments_store/
