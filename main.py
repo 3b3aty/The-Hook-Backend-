@@ -693,6 +693,9 @@ def _create_email_from_gmail_message(
 
     sender_user = _get_or_create_external_user(sender_email, sender_name)
     receiver_user = _get_or_create_external_user(receiver_email, receiver_name)
+    is_self_sent = "SENT" in labels or (
+        sender_email and user.email and sender_email.strip().lower() == user.email.strip().lower()
+    )
 
     interface_record = models.Interface(
         sender_id=sender_user.id if sender_user else None,
@@ -765,9 +768,13 @@ def _create_email_from_gmail_message(
 
     db.commit()
 
-    enqueue_email_analysis(email_record.id)
+    if not is_self_sent:
+        enqueue_email_analysis(email_record.id)
     if send_each_email and notify_user_id is not None:
-        _send_email_received(db, notify_user_id, email_record)
+        if is_self_sent:
+            _send_email_updated(db, notify_user_id, email_record)
+        else:
+            _send_email_received(db, notify_user_id, email_record)
 
     return email_record
 
@@ -1012,7 +1019,13 @@ def _get_sender_for_email(db: Session, email_id: int, receiver_id: int) -> Optio
     return (
         db.query(models.User)
         .join(models.Interface, models.Interface.sender_id == models.User.id)
-        .filter(models.Interface.email_id == email_id, models.Interface.receiver_id == receiver_id)
+        .filter(
+            models.Interface.email_id == email_id,
+            or_(
+                models.Interface.receiver_id == receiver_id,
+                models.Interface.sender_id == receiver_id,
+            ),
+        )
         .first()
     )
 
@@ -1925,8 +1938,6 @@ async def send_email(
     email_record.delivery_status = normalized_delivery_status
     email_record.is_read = True
     db.commit()
-
-    enqueue_email_analysis(email_record.id)
 
     return {
         "email_id": email_record.id,
