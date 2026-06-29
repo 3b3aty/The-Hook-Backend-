@@ -2,6 +2,11 @@ import os
 
 from celery import Celery
 from kombu import Queue
+from database import engine, ensure_runtime_schema
+import models
+
+models.Base.metadata.create_all(bind=engine)
+ensure_runtime_schema()
 
 BROKER_URL = os.getenv("CELERY_BROKER_URL", "amqp://guest:guest@localhost:5672//")
 RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "cache+memory://")
