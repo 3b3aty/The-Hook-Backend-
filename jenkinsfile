@@ -115,6 +115,16 @@ pipeline {
             }
         }
 
+        stage('Push Image to DockerHub') {
+            steps {
+                sh '''
+                    echo "$DOCKERHUB_CREDS_PSW" | docker login -u "$DOCKERHUB_CREDS_USR" --password-stdin
+                    docker push ${DOCKERHUB_REPO}:${IMAGE_TAG}
+                    docker push ${DOCKERHUB_REPO}:latest
+                '''
+            }
+        }
+        
         stage('Scan - Trivy (Image + FS + SBOM)') {
             steps {
                 sh '''
@@ -134,15 +144,6 @@ pipeline {
             }
         }
 
-        stage('Push Image to DockerHub') {
-            steps {
-                sh '''
-                    echo "$DOCKERHUB_CREDS_PSW" | docker login -u "$DOCKERHUB_CREDS_USR" --password-stdin
-                    docker push ${DOCKERHUB_REPO}:${IMAGE_TAG}
-                    docker push ${DOCKERHUB_REPO}:latest
-                '''
-            }
-        }
 
         stage('Deploy to Staging (for DAST)') {
             steps {
