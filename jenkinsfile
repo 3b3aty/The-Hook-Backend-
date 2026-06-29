@@ -118,11 +118,13 @@ pipeline {
         stage('Scan - Trivy (Image + FS + SBOM)') {
             steps {
                 sh '''
-                    . venv/bin/activate
-                    pip install trivy  || true
-                    trivy fs --format json --output trivy-fs-report.json . || true
-                    trivy image --format json --output trivy-image-report.json ${DOCKERHUB_REPO}:${IMAGE_TAG} || true
-                    trivy sbom --format json --output trivy-sbom-report.json sbom.json || true
+                    docker run --rm -v "$PWD":/repo aquasec/trivy:latest trivy --version
+                    docker run --rm -v "$PWD":/repo aquasec/trivy:latest \
+                        trivy fs --format json --output trivy-fs-report.json . || true
+                    docker run --rm -v "$PWD":/repo aquasec/trivy:latest \
+                        trivy image --format json --output trivy-image-report.json ${DOCKERHUB_REPO}:${IMAGE_TAG} || true
+                    docker run --rm -v "$PWD":/repo aquasec/trivy:latest \
+                        trivy sbom --format json --output trivy-sbom-report.json sbom.json || true
                 '''
             }
             post {
