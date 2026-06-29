@@ -128,15 +128,36 @@ pipeline {
         stage('Scan - Trivy (Image + FS + SBOM)') {
             steps {
                 sh '''
-                    docker run --rm -v "$PWD":/repo aquasec/trivy:latest --version
-                    docker run --rm -v "$PWD":/repo aquasec/trivy:latest \
-                        fs --format json --output trivy-fs-report.json . || true
-                    docker run --rm -v "$PWD":/repo aquasec/trivy:latest \
-                        image --format json --output trivy-image-report.json ${DOCKERHUB_REPO}:${IMAGE_TAG} || true
-                    docker run --rm -v "$PWD":/repo aquasec/trivy:latest \
-                        sbom --format json --output trivy-sbom-report.json sbom.json || true
+                    mkdir -p .trivy-cache
+
+                    # Show Trivy version
+                    docker run --rm \
+                        -v "$PWD":/repo \
+                        -v "$PWD/.trivy-cache:/root/.cache/trivy" \
+                        aquasec/trivy:latest --version
+
+                    # Filesystem Scan
+                    docker run --rm \
+                        -v "$PWD":/repo \
+                        -v "$PWD/.trivy-cache:/root/.cache/trivy" \
+                        aquasec/trivy:latest \
+                        fs \
+                        --format json \
+                        --output /repo/trivy-fs-report.json \
+                        /repo || true
+
+                    # Docker Image Scan
+                    docker run --rm \
+                        -v "$PWD":/repo \
+                        -v "$PWD/.trivy-cache:/root/.cache/trivy" \
+                        aquasec/trivy:latest \
+                        image \
+                        --format json \
+                        --output /repo/trivy-image-report.json \
+                        ${DOCKERHUB_REPO}:${IMAGE_TAG} || true
                 '''
             }
+
             post {
                 always {
                     archiveArtifacts artifacts: 'trivy-*-report.json', allowEmptyArchive: true
@@ -274,6 +295,8 @@ pipeline {
 
                         git config user.email "omarhussein2111@gmail.com"
                         git config user.name "Eng-Omar-Hussein"
+                        git remote set-url origin ${GITOPS_REPO}
+                        
                         git add ${GITOPS_DIR}/email-api-deployment.yaml
                         git commit -m "ci: bump ${APP_NAME} image to ${IMAGE_TAG}" || echo "No changes to commit"
                         git push origin HEAD:main
