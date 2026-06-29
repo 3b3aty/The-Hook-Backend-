@@ -26,7 +26,7 @@ import logging
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
-from database import SessionLocal, engine
+from database import SessionLocal, engine, ensure_runtime_schema
 import models
 from message_queue.producer import enqueue_email_analysis
 from websocket.manager import manager
@@ -35,6 +35,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 models.Base.metadata.create_all(bind=engine)
+ensure_runtime_schema()
 
 app = FastAPI()
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -1047,8 +1048,13 @@ def _serialize_urls(rows: List[models.UrlsExtracted]) -> List[Dict[str, Any]]:
     return [
         {
             "url": row.url,
+            "domain": row.domain,
+            "score": row.score,
             "verdict": row.verdict,
             "reasons": _normalize_reasons(row.reasons),
+            "final_url": row.final_url,
+            "http_status": row.http_status,
+            "redirect_count": row.redirect_count,
             "status": row.status,
         }
         for row in rows
@@ -1061,6 +1067,8 @@ def _serialize_body(row: Optional[models.BodyClassification]) -> Optional[Dict[s
     return {
         "verdict": row.verdict,
         "confidence": row.confidence,
+        "probabilities": row.probabilities or {},
+        "class_id": row.class_id,
         "status": row.status,
     }
 
@@ -1077,16 +1085,29 @@ def _serialize_headers(row: Optional[models.EmailHeaders]) -> Optional[Dict[str,
 
 
 def _serialize_attachments(rows: List[models.Attachments]) -> List[Dict[str, Any]]:
-    return [
-        {
+    payload = []
+    for row in rows:
+        item = {
             "file_name": row.file_name,
             "file_type": row.file_type,
             "file_size": row.file_size,
             "hash_sha256": row.hash_sha256,
             "status": row.status,
         }
-        for row in rows
-    ]
+        if row.static_analysis:
+            item["static_analysis"] = {
+                "score": row.static_analysis.score,
+                "verdict": row.static_analysis.verdict,
+                "reasons": _normalize_reasons(row.static_analysis.reasons),
+            }
+        if row.dynamic_analysis:
+            item["dynamic_analysis"] = {
+                "score": row.dynamic_analysis.score,
+                "verdict": row.dynamic_analysis.verdict,
+                "reasons": _normalize_reasons(row.dynamic_analysis.reasons),
+            }
+        payload.append(item)
+    return payload
 
 
 def _collect_analysis_results(db: Session, email_id: int) -> Dict[str, Any]:

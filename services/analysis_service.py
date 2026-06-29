@@ -1,15 +1,25 @@
-from typing import Any, Dict, List
-import time
+from typing import Any, Dict, List, Optional
+import html
 import requests
 import logging
-
+import os
+import re
+from dotenv import load_dotenv
+load_dotenv()
 logger = logging.getLogger(__name__)
 
-CLOUD_BASE_URL = "http://52.23.226.104:8000"
-URL_ANALYSIS_ENDPOINT = f"{CLOUD_BASE_URL}/analyze-url"
-ATTACHMENT_UPLOAD_ENDPOINT = f"{CLOUD_BASE_URL}/upload"
-ATTACHMENT_STATUS_ENDPOINT = f"{CLOUD_BASE_URL}/status"  # + /{task_id}
-REQUEST_TIMEOUT = 30  # seconds per request
+URL_ANALYSIS_ENDPOINT = os.getenv(
+    "URL_ANALYSIS_ENDPOINT"
+)
+ATTACHMENT_ANALYSIS_ENDPOINT = os.getenv(
+    "ATTACHMENT_ANALYSIS_ENDPOINT"
+)
+BODY_ANALYSIS_ENDPOINT = os.getenv(
+    "BODY_ANALYSIS_ENDPOINT"
+)
+REQUEST_TIMEOUT = int(os.getenv("ANALYSIS_REQUEST_TIMEOUT", "45"))
+ATTACHMENT_REQUEST_TIMEOUT = int(os.getenv("ATTACHMENT_ANALYSIS_TIMEOUT", "240"))
+BODY_REQUEST_TIMEOUT = int(os.getenv("BODY_ANALYSIS_TIMEOUT", "90"))
 
 
 def analyze_single_url(url: str) -> Dict[str, Any]:
@@ -48,21 +58,14 @@ def analyze_urls_api(email: Any, urls: List[str]) -> List[Dict[str, Any]]:
     return results
 
 
-def upload_attachment(file_path: str, file_name: str) -> Dict[str, Any]:
-    """Upload a file to the cloud attachment analysis endpoint (POST /upload).
-
-    Returns the API response dict. Possible shapes:
-    - Queued:  {"message": "File queued for analysis", "task_id": "<uuid>", "sha256": "..."}
-    - Cached:  {"message": "File already analyzed", "task_id": null, "sha256": "...",
-                "score": 0, "verdict": "Benign", "reasons": []}
-    - Error:   {"error": "<message>"}
-    """
+def analyze_attachment_api(file_path: str, file_name: str) -> Dict[str, Any]:
+    """Submit an attachment to the single cloud analysis endpoint."""
     try:
         with open(file_path, "rb") as f:
             response = requests.post(
-                ATTACHMENT_UPLOAD_ENDPOINT,
+                ATTACHMENT_ANALYSIS_ENDPOINT,
                 files={"file": (file_name, f)},
-                timeout=REQUEST_TIMEOUT,
+                timeout=ATTACHMENT_REQUEST_TIMEOUT,
             )
         response.raise_for_status()
         return response.json()
@@ -70,37 +73,75 @@ def upload_attachment(file_path: str, file_name: str) -> Dict[str, Any]:
         logger.error("Attachment file not found on disk: %s", file_path)
         return {"error": f"File not found: {file_path}"}
     except requests.RequestException as exc:
-        logger.error("Attachment upload failed for %s: %s", file_name, exc)
-        return {"error": f"Upload request failed: {exc}"}
+        logger.error("Attachment analysis failed for %s: %s", file_name, exc)
+        return {"error": f"Attachment analysis request failed: {exc}"}
 
 
-def check_attachment_status(task_id: str) -> Dict[str, Any]:
-    """Poll the cloud analysis status for an uploaded attachment (GET /status/{task_id}).
+def _clean_text(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p\s*>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
 
-    Returns the API response dict. Possible shapes:
-    - Success: {"task_id": "...", "state": "SUCCESS",
-                "result": {"score": 0, "verdict": "benign", "reasons": [...]}}
-    - Pending: {"task_id": "...", "state": "PENDING", ...}
-    - Error:   {"error": "<message>"}
-    """
-    try:
-        response = requests.get(
-            f"{ATTACHMENT_STATUS_ENDPOINT}/{task_id}",
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as exc:
-        logger.error("Attachment status check failed for task %s: %s", task_id, exc)
-        return {"error": f"Status check failed: {exc}"}
+
+def _parse_confidence(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith("%"):
+            try:
+                return float(text[:-1]) / 100.0
+            except ValueError:
+                return None
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+
+    if number > 1.0:
+        number = number / 100.0
+    return min(max(number, 0.0), 1.0)
 
 
 def analyze_body_api(email: Any) -> Dict[str, Any]:
-    time.sleep(2)
-    return {
-        "verdict": "clean",
-        "confidence": 0.01,
-    }
+    """Classify the email body via the body-analysis service."""
+    text = _clean_text(getattr(email, "body_full", "") or "")
+    try:
+        response = requests.post(
+            BODY_ANALYSIS_ENDPOINT,
+            json={"text": text},
+            timeout=BODY_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        prediction = payload.get("prediction") or payload.get("verdict") or "UNKNOWN"
+        return {
+            "verdict": prediction,
+            "confidence": _parse_confidence(payload.get("confidence")),
+            "probabilities": payload.get("probabilities") or {},
+            "class_id": payload.get("class_id"),
+            "raw_response": payload,
+        }
+    except requests.RequestException as exc:
+        logger.error("Body analysis request failed for email %s: %s", getattr(email, "id", None), exc)
+        return {
+            "verdict": "ERROR",
+            "confidence": None,
+            "probabilities": {},
+            "error": f"Body analysis request failed: {exc}",
+        }
 
 
 def analyze_headers_api(email: Any, headers_raw: str | None) -> Dict[str, Any]:

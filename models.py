@@ -237,6 +237,11 @@ class UrlsExtracted(Base):
 
     reasons = Column(JSON, nullable=True)
     verdict = Column(String, nullable=True)
+    score = Column(Float, nullable=True)
+    domain = Column(String, nullable=True)
+    final_url = Column(String, nullable=True)
+    http_status = Column(Integer, nullable=True)
+    redirect_count = Column(Integer, nullable=True)
 
     status = Column(String, default="PENDING")
     analyzed_at = Column(DateTime, nullable=True)
@@ -317,6 +322,8 @@ class BodyClassification(Base):
 
     confidence = Column(Float, nullable=True)
     verdict = Column(String, nullable=True)
+    probabilities = Column(JSON, nullable=True)
+    class_id = Column(Integer, nullable=True)
 
     status = Column(String, default="PENDING")
     analyzed_at = Column(DateTime(timezone=True), server_default=func.now())
