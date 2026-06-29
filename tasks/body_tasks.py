@@ -1,4 +1,3 @@
-import json
 from datetime import datetime, timezone
 
 from celery_app import celery_app
@@ -25,6 +24,8 @@ def analyze_body(email_id: int) -> dict:
         db.commit()
 
         result = analyze_body_api(email)
+        if "error" in result:
+            raise RuntimeError(result["error"])
         now = datetime.now(timezone.utc)
 
         body_row = (
@@ -37,14 +38,22 @@ def analyze_body(email_id: int) -> dict:
             db.add(body_row)
 
         body_row.verdict = result.get("verdict")
-        confidence = result.get("confidence") or result.get("score")
+        confidence = result.get("confidence")
+        if confidence is None:
+            confidence = result.get("score")
         body_row.confidence = float(confidence) if confidence is not None else None
+        body_row.probabilities = result.get("probabilities") or {}
+        body_row.class_id = result.get("class_id")
         body_row.status = "DONE"
         body_row.analyzed_at = now
 
         email.body_status = "DONE"
-        final_payload = maybe_finalize_email(db, email)
         db.commit()
+
+        email = db.query(models.Email).filter(models.Email.id == email_id).first()
+        final_payload = maybe_finalize_email(db, email) if email else None
+        if final_payload:
+            db.commit()
 
         user_id = get_receiver_user_id(db, email_id)
         if user_id:
@@ -76,16 +85,22 @@ def analyze_body(email_id: int) -> dict:
         body_row.status = "FAILED"
         body_row.verdict = "error"
         body_row.confidence = None
+        body_row.probabilities = {}
+        body_row.class_id = None
         body_row.analyzed_at = now
 
         email = db.query(models.Email).filter(models.Email.id == email_id).first()
         if email:
             email.body_status = "FAILED"
-            final_payload = maybe_finalize_email(db, email)
         else:
             final_payload = None
 
         db.commit()
+        if email:
+            email = db.query(models.Email).filter(models.Email.id == email_id).first()
+            final_payload = maybe_finalize_email(db, email) if email else None
+            if final_payload:
+                db.commit()
         user_id = get_receiver_user_id(db, email_id)
         if user_id:
             publish_event(

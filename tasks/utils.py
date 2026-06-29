@@ -10,15 +10,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Verdict keyword sets used for mapping sub-analysis verdicts to scores
 # ---------------------------------------------------------------------------
-_MALICIOUS_VERDICTS = {"phishing", "malicious"}
-_SUSPICIOUS_VERDICTS = {"suspicious", "fail", "softfail"}
+_MALICIOUS_VERDICTS = {"phishing", "malicious", "malware", "unsafe", "dangerous"}
+_SUSPICIOUS_VERDICTS = {"suspicious", "fail", "softfail", "spam"}
 _CLEAN_VERDICTS = {"clean", "safe", "benign", "legitimate", "pass", "neutral"}
 
 # Component weights (must sum to 1.0)
-_WEIGHT_HEADERS = 0.30
-_WEIGHT_URLS = 0.30
-_WEIGHT_ATTACHMENTS = 0.25
-_WEIGHT_BODY = 0.15
+_WEIGHT_HEADERS = 0.25
+_WEIGHT_URLS = 0.35
+_WEIGHT_ATTACHMENTS = 0.30
+_WEIGHT_BODY = 0.10
 
 
 def normalize_reasons(value: Any) -> List[str]:
@@ -54,8 +54,13 @@ def serialize_urls(rows: List[models.UrlsExtracted]) -> List[Dict[str, Any]]:
     return [
         {
             "url": row.url,
+            "domain": row.domain,
+            "score": row.score,
             "verdict": row.verdict,
             "reasons": normalize_reasons(row.reasons),
+            "final_url": row.final_url,
+            "http_status": row.http_status,
+            "redirect_count": row.redirect_count,
             "status": row.status,
         }
         for row in rows
@@ -68,6 +73,8 @@ def serialize_body(row: Optional[models.BodyClassification]) -> Optional[Dict[st
     return {
         "verdict": row.verdict,
         "confidence": row.confidence,
+        "probabilities": row.probabilities or {},
+        "class_id": row.class_id,
         "status": row.status,
     }
 
@@ -84,16 +91,29 @@ def serialize_headers(row: Optional[models.EmailHeaders]) -> Optional[Dict[str, 
 
 
 def serialize_attachments(rows: List[models.Attachments]) -> List[Dict[str, Any]]:
-    return [
-        {
+    payload = []
+    for row in rows:
+        item = {
             "file_name": row.file_name,
             "file_type": row.file_type,
             "file_size": row.file_size,
             "hash_sha256": row.hash_sha256,
             "status": row.status,
         }
-        for row in rows
-    ]
+        if row.static_analysis:
+            item["static_analysis"] = {
+                "score": row.static_analysis.score,
+                "verdict": row.static_analysis.verdict,
+                "reasons": normalize_reasons(row.static_analysis.reasons),
+            }
+        if row.dynamic_analysis:
+            item["dynamic_analysis"] = {
+                "score": row.dynamic_analysis.score,
+                "verdict": row.dynamic_analysis.verdict,
+                "reasons": normalize_reasons(row.dynamic_analysis.reasons),
+            }
+        payload.append(item)
+    return payload
 
 
 def collect_results(db, email_id: int) -> Dict[str, Any]:
@@ -141,6 +161,18 @@ def _verdict_to_score(verdict: Optional[str]) -> float:
     return 0.25
 
 
+def _normalize_api_score(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    if score > 1.0:
+        score = score / 100.0
+    return min(max(score, 0.0), 1.0)
+
+
 def _score_headers(headers: Optional[Dict[str, Any]]) -> Optional[float]:
     """Return a normalized 0.0–1.0 score for the headers component.
 
@@ -156,7 +188,9 @@ def _score_headers(headers: Optional[Dict[str, Any]]) -> Optional[float]:
     # The header analysis engine returns a score 0–100
     raw_score = headers.get("score")
     if raw_score is not None:
-        return min(max(float(raw_score) / 100.0, 0.0), 1.0)
+        normalized = _normalize_api_score(raw_score)
+        if normalized is not None:
+            return normalized
 
     # Fallback to verdict mapping if no numeric score
     return _verdict_to_score(headers.get("verdict"))
@@ -175,12 +209,15 @@ def _score_urls(url_items: List[Dict[str, Any]]) -> Optional[float]:
     if not analyzed:
         return None
 
-    total_score = 0.0
+    scores: List[float] = []
     for item in analyzed:
-        total_score += _verdict_to_score(item.get("verdict"))
+        numeric_score = _normalize_api_score(item.get("score"))
+        if numeric_score is not None:
+            scores.append(numeric_score)
+        else:
+            scores.append(_verdict_to_score(item.get("verdict")))
 
-    # Average severity across all analyzed URLs
-    return total_score / len(analyzed)
+    return max(scores) if scores else None
 
 
 def _score_attachments(attachment_items: List[Dict[str, Any]], db=None, email_id: int = 0) -> Optional[float]:
@@ -205,12 +242,27 @@ def _score_attachments(attachment_items: List[Dict[str, Any]], db=None, email_id
                 continue
             if att.static_analysis and att.static_analysis.score is not None:
                 # Cloud analysis score — normalize from 0–100 to 0–1
-                static_scores.append(min(max(float(att.static_analysis.score) / 100.0, 0.0), 1.0))
+                normalized = _normalize_api_score(att.static_analysis.score)
+                if normalized is not None:
+                    static_scores.append(normalized)
             elif att.static_analysis and att.static_analysis.verdict:
                 static_scores.append(_verdict_to_score(att.static_analysis.verdict))
 
     if static_scores:
         return max(static_scores)  # Take the worst attachment
+
+    for item in attachment_items:
+        if (item.get("status") or "").upper() == "FAILED":
+            continue
+        static_analysis = item.get("static_analysis") or {}
+        numeric_score = _normalize_api_score(static_analysis.get("score"))
+        if numeric_score is not None:
+            static_scores.append(numeric_score)
+        elif static_analysis.get("verdict"):
+            static_scores.append(_verdict_to_score(static_analysis.get("verdict")))
+
+    if static_scores:
+        return max(static_scores)
 
     # Fallback: no static analysis data available — use serialized status only
     analyzed = [a for a in attachment_items if (a.get("status") or "").upper() not in ("FAILED",)]
@@ -302,6 +354,23 @@ def compute_final_verdict(results: Dict[str, Any], db=None, email_id: int = 0) -
     risk_score = round(weighted_sum * 100.0, 1)
     risk_score = min(max(risk_score, 0.0), 100.0)
 
+    critical_url = component_scores.get("urls")
+    critical_attachment = component_scores.get("attachments")
+    critical_header = component_scores.get("headers")
+    high_confidence_threat = any(
+        score is not None and score >= 0.85
+        for score in (critical_url, critical_attachment)
+    ) or (critical_header is not None and critical_header >= 0.95)
+    medium_confidence_threat = any(
+        score is not None and score >= 0.65
+        for score in (critical_url, critical_attachment)
+    )
+
+    if high_confidence_threat:
+        risk_score = max(risk_score, 75.0)
+    elif medium_confidence_threat:
+        risk_score = max(risk_score, 45.0)
+
     # Determine verdict
     if risk_score >= 60:
         verdict = "PHISHING"
@@ -334,6 +403,8 @@ def maybe_finalize_email(db, email: models.Email) -> Optional[Dict[str, Any]]:
         email.status = "ANALYZED"
         email.risk_score = risk_score
         email.final_verdict = final_verdict
+        if email.user_act is None:
+            email.user_act = final_verdict
         email.is_hooked = final_verdict == "PHISHING"
         email.analyzed_at = datetime.now(timezone.utc)
         category_name = email.category.name if email.category else None

@@ -42,8 +42,12 @@ def analyze_headers(email_id: int) -> dict:
         headers_row.analyzed_at = now
 
         email.headers_status = "DONE"
-        final_payload = maybe_finalize_email(db, email)
         db.commit()
+
+        email = db.query(models.Email).filter(models.Email.id == email_id).first()
+        final_payload = maybe_finalize_email(db, email) if email else None
+        if final_payload:
+            db.commit()
 
         user_id = get_receiver_user_id(db, email_id)
         if user_id:
@@ -80,11 +84,15 @@ def analyze_headers(email_id: int) -> dict:
         email = db.query(models.Email).filter(models.Email.id == email_id).first()
         if email:
             email.headers_status = "FAILED"
-            final_payload = maybe_finalize_email(db, email)
         else:
             final_payload = None
 
         db.commit()
+        if email:
+            email = db.query(models.Email).filter(models.Email.id == email_id).first()
+            final_payload = maybe_finalize_email(db, email) if email else None
+            if final_payload:
+                db.commit()
         user_id = get_receiver_user_id(db, email_id)
         if user_id:
             publish_event(

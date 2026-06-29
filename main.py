@@ -26,7 +26,7 @@ import logging
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
-from database import SessionLocal, engine
+from database import SessionLocal, engine, ensure_runtime_schema
 import models
 from message_queue.producer import enqueue_email_analysis
 from websocket.manager import manager
@@ -35,6 +35,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 models.Base.metadata.create_all(bind=engine)
+ensure_runtime_schema()
 
 app = FastAPI()
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -988,6 +989,7 @@ def _serialize_email(email: models.Email) -> Dict[str, Any]:
         "delivery_status": email.delivery_status,
         "risk_score": email.risk_score,
         "final_verdict": email.final_verdict,
+        "user_act": email.user_act,
         "urls_status": email.urls_status,
         "body_status": email.body_status,
         "headers_status": email.headers_status,
@@ -1051,8 +1053,13 @@ def _serialize_urls(rows: List[models.UrlsExtracted]) -> List[Dict[str, Any]]:
     return [
         {
             "url": row.url,
+            "domain": row.domain,
+            "score": row.score,
             "verdict": row.verdict,
             "reasons": _normalize_reasons(row.reasons),
+            "final_url": row.final_url,
+            "http_status": row.http_status,
+            "redirect_count": row.redirect_count,
             "status": row.status,
         }
         for row in rows
@@ -1065,6 +1072,8 @@ def _serialize_body(row: Optional[models.BodyClassification]) -> Optional[Dict[s
     return {
         "verdict": row.verdict,
         "confidence": row.confidence,
+        "probabilities": row.probabilities or {},
+        "class_id": row.class_id,
         "status": row.status,
     }
 
@@ -1081,16 +1090,29 @@ def _serialize_headers(row: Optional[models.EmailHeaders]) -> Optional[Dict[str,
 
 
 def _serialize_attachments(rows: List[models.Attachments]) -> List[Dict[str, Any]]:
-    return [
-        {
+    payload = []
+    for row in rows:
+        item = {
             "file_name": row.file_name,
             "file_type": row.file_type,
             "file_size": row.file_size,
             "hash_sha256": row.hash_sha256,
             "status": row.status,
         }
-        for row in rows
-    ]
+        if row.static_analysis:
+            item["static_analysis"] = {
+                "score": row.static_analysis.score,
+                "verdict": row.static_analysis.verdict,
+                "reasons": _normalize_reasons(row.static_analysis.reasons),
+            }
+        if row.dynamic_analysis:
+            item["dynamic_analysis"] = {
+                "score": row.dynamic_analysis.score,
+                "verdict": row.dynamic_analysis.verdict,
+                "reasons": _normalize_reasons(row.dynamic_analysis.reasons),
+            }
+        payload.append(item)
+    return payload
 
 
 def _collect_analysis_results(db: Session, email_id: int) -> Dict[str, Any]:
@@ -1284,6 +1306,11 @@ class SendEmailRequest(BaseModel):
     )
 
 
+class VerdictActionRequest(BaseModel):
+    state: str = Field(..., description="Target state for the user action")
+    reason: str = Field(..., description="Reason for the user action")
+
+
 def _normalize_int_list(value: Any) -> List[int]:
     ids: List[int] = []
     for item in _normalize_string_list(value):
@@ -1312,7 +1339,10 @@ def get_emails(
     query = (
         db.query(models.Email)
         .join(models.Interface, models.Interface.email_id == models.Email.id)
-        .filter(models.Interface.receiver_id == user.id)
+        .filter(
+            (models.Interface.receiver_id == user.id) |
+            (models.Interface.sender_id == user.id)
+        )
     )
 
     if normalized_status != "all":
@@ -1914,6 +1944,7 @@ async def send_email(
 @app.patch("/emails/{email_id}/read", tags = ['flags'])
 def mark_email_read(
     email_id: int,
+    value: bool = True,
     user: models.User = Depends(get_current_user_from_auth),
     db: Session = Depends(get_db),
 ):
@@ -1942,17 +1973,25 @@ def mark_email_read(
             logger.warning("Failed to sync Gmail state for %s: %s", email.gmail_message_id, str(exc.detail))
 
     if email.gmail_message_id:
-        _gmail_modify_message_labels(
-            user,
-            db,
-            email.gmail_message_id,
-            remove_labels=["UNREAD"],
-        )
+        if value:
+            _gmail_modify_message_labels(
+                user,
+                db,
+                email.gmail_message_id,
+                remove_labels=["UNREAD"],
+            )
+        else:
+            _gmail_modify_message_labels(
+                user,
+                db,
+                email.gmail_message_id,
+                add_labels=["UNREAD"],
+            )
 
-    email.is_read = True
+    email.is_read = value
     db.commit()
 
-    return {"email_id": email_id, "is_read": True}
+    return {"email_id": email_id, "is_read": value}
 
 
 @app.patch("/emails/{email_id}/trash", tags = ['flags'])
@@ -2148,6 +2187,48 @@ def mark_email_starred(
     db.commit()
 
     return {"email_id": email_id, "is_starred": email.is_starred}
+
+
+@app.patch("/emails/{email_id}/verdict", tags = ['flags'])
+def update_email_verdict(
+    email_id: int,
+    action: VerdictActionRequest = Body(...),
+    user: models.User = Depends(get_current_user_from_auth),
+    db: Session = Depends(get_db),
+):
+    email = (
+        db.query(models.Email)
+        .join(models.Interface, models.Interface.email_id == models.Email.id)
+        .filter(
+            models.Email.id == email_id,
+            or_(
+                models.Interface.receiver_id == user.id,
+                models.Interface.sender_id == user.id,
+            ),
+        )
+        .first()
+    )
+    if not email:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    from_state = email.user_act or email.final_verdict or ""
+    user_action = models.UserAction(
+        email_id=email.id,
+        from_action=from_state,
+        to_action=action.state,
+        reasons=action.reason,
+    )
+    db.add(user_action)
+    email.user_act = action.state
+    db.commit()
+
+    return {
+        "email_id": email.id,
+        "from_state": from_state,
+        "to_action": action.state,
+        "reasons": action.reason,
+        "user_act": email.user_act,
+    }
 
 
 @app.patch("/emails/{email_id}/draft_edit", tags = ['emails'])
