@@ -6,14 +6,14 @@ pipeline {
         DOCKERHUB_REPO     = "omarhussein2111/email-api"
         GITOPS_REPO        = "git@github.com:Eng-Omar-Hussein/The-Hook-Backend.git"
         GITOPS_DIR         = "k8s"
-        DEFECTDOJO_URL     = "http://54.164.24.188:8080"
-        DTRACK_URL         = "http://54.164.24.188:8081"
+        DEFECTDOJO_URL     = "http://34.204.45.80:8080"
+        DTRACK_URL         = "http://34.204.45.80:8081"
         DTRACK_PROJECT_ID  = credentials('dtrack-project-id')
         DOCKERHUB_CREDS    = credentials('dockerhub-creds')
         DEFECTDOJO_TOKEN   = credentials('defectdojo-api-token')
         DTRACK_API_KEY     = credentials('dtrack-api-key')
         EMAIL_RECIPIENTS   = "omarhussein2111@gmail.com"
-        ZAP_TARGET_URL     = "http://localhost:8000"
+        ZAP_TARGET_URL     = "http://localhost:8089"
     }
 
     options {
@@ -170,10 +170,10 @@ pipeline {
             steps {
                 sh '''
                     docker rm -f fastapi02-staging || true
-                    docker run -d --name fastapi02-staging -p 8000:8000 ${DOCKERHUB_REPO}:${IMAGE_TAG}
+                    docker run -d --name fastapi02-staging -p 8089:8000 ${DOCKERHUB_REPO}:${IMAGE_TAG}
 
                     for i in $(seq 1 20); do
-                        if curl -sf http://localhost:8000/docs > /dev/null 2>&1; then
+                        if curl -sf http://localhost:8089/docs > /dev/null 2>&1; then
                             echo "App is ready"
                             break
                         fi
@@ -282,28 +282,57 @@ pipeline {
             }
         }
 
-        stage('CD - Update GitOps Repo for ArgoCD') {
+        stage('Update Manifest & Push to GitHub') {
             steps {
-                sshagent(credentials: ['github-ssh-key']) {
-                        // rm -rf ${GITOPS_DIR}
-                        // git clone ${GITOPS_REPO} ${GITOPS_DIR}
-                        // cd ${GITOPS_DIR}
-                    sh """
-                        # Update image tag inside the app's ConfigMap/deployment manifest
-                        # yq e -i '.data.IMAGE_TAG = "${IMAGE_TAG}"' apps/${APP_NAME}/configmap.yaml
-                        sed -i -E "s|(^[[:space:]]*image: )omarhussein2111/.*|\1${DOCKERHUB_REPO}:${IMAGE_TAG}|g" ${GITOPS_DIR}/email-api-deployment.yaml
+                withCredentials([usernamePassword(
+                    credentialsId: 'github-creds',
+                    usernameVariable: 'GITHUB_USER',
+                    passwordVariable: 'GITHUB_TOKEN'
+                )]) {
+                    sh '''
+                        sed -i -E "s|(^[[:space:]]*image: )omarhussein2111/.*|\\1${DOCKERHUB_REPO}:${IMAGE_TAG}|g" k8s/email-api-deployment.yaml
 
                         git config user.email "omarhussein2111@gmail.com"
                         git config user.name "Eng-Omar-Hussein"
-                        git remote set-url origin ${GITOPS_REPO}
-                        
-                        git add ${GITOPS_DIR}/email-api-deployment.yaml
-                        git commit -m "ci: bump ${APP_NAME} image to ${IMAGE_TAG}" || echo "No changes to commit"
+
+                        git add k8s/email-api-deployment.yaml
+
+                        if git diff --cached --quiet; then
+                            echo "No changes to commit."
+                            exit 0
+                        fi
+
+                        git commit -m "ci: bump email-api image to ${IMAGE_TAG}"
+
+                        git remote set-url origin https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/Eng-Omar-Hussein/The-Hook-Backend.git
+
                         git push origin HEAD:main
-                    """
+                    '''
                 }
             }
         }
+        // stage('CD - Update GitOps Repo for ArgoCD') {
+        //     steps {
+        //         sshagent(credentials: ['github-ssh-key']) {
+        //                 // rm -rf ${GITOPS_DIR}
+        //                 // git clone ${GITOPS_REPO} ${GITOPS_DIR}
+        //                 // cd ${GITOPS_DIR}
+        //             sh """
+        //                 # Update image tag inside the app's ConfigMap/deployment manifest
+        //                 # yq e -i '.data.IMAGE_TAG = "${IMAGE_TAG}"' apps/${APP_NAME}/configmap.yaml
+        //                 sed -i -E "s|(^[[:space:]]*image: )omarhussein2111/.*|\1${DOCKERHUB_REPO}:${IMAGE_TAG}|g" ${GITOPS_DIR}/email-api-deployment.yaml
+
+        //                 git config user.email "omarhussein2111@gmail.com"
+        //                 git config user.name "Eng-Omar-Hussein"
+        //                 git remote set-url origin ${GITOPS_REPO}
+                        
+        //                 git add ${GITOPS_DIR}/email-api-deployment.yaml
+        //                 git commit -m "ci: bump ${APP_NAME} image to ${IMAGE_TAG}" || echo "No changes to commit"
+        //                 git push origin HEAD:main
+        //             """
+        //         }
+        //     }
+        // }
     }
 
     post {
