@@ -6,13 +6,13 @@ pipeline {
         DOCKERHUB_REPO     = "omarhussein2111/email-api"
         GITOPS_REPO        = "git@github.com:Eng-Omar-Hussein/The-Hook-Backend.git"
         GITOPS_DIR         = "k8s"
-        DEFECTDOJO_URL     = "http://34.204.45.80:8080"
-        DTRACK_URL         = "http://34.204.45.80:8081"
+        DEFECTDOJO_URL     = "http://32.199.177.221:8080"
+        DTRACK_URL         = "http://32.199.177.221:8081"
         DTRACK_PROJECT_ID  = credentials('dtrack-project-id')
         DOCKERHUB_CREDS    = credentials('dockerhub-creds')
         DEFECTDOJO_TOKEN   = credentials('defectdojo-api-token')
         DTRACK_API_KEY     = credentials('dtrack-api-key')
-        EMAIL_RECIPIENTS   = "omarhussein2111@gmail.com"
+        EMAIL_RECIPIENTS   = "ahmedabokheira@gmail.com"
         ZAP_TARGET_URL     = "http://localhost:8089"
     }
 
@@ -43,6 +43,8 @@ pipeline {
         stage('Install Deps') {
             steps {
                 sh '''
+                    pip install --upgrade pip
+                    apt-get update && apt-get install -y python3-venv
                     python3 -m venv venv
                     . venv/bin/activate
                     pip install -r requirements.txt
@@ -311,46 +313,29 @@ pipeline {
                 }
             }
         }
-        // stage('CD - Update GitOps Repo for ArgoCD') {
-        //     steps {
-        //         sshagent(credentials: ['github-ssh-key']) {
-        //                 // rm -rf ${GITOPS_DIR}
-        //                 // git clone ${GITOPS_REPO} ${GITOPS_DIR}
-        //                 // cd ${GITOPS_DIR}
-        //             sh """
-        //                 # Update image tag inside the app's ConfigMap/deployment manifest
-        //                 # yq e -i '.data.IMAGE_TAG = "${IMAGE_TAG}"' apps/${APP_NAME}/configmap.yaml
-        //                 sed -i -E "s|(^[[:space:]]*image: )omarhussein2111/.*|\1${DOCKERHUB_REPO}:${IMAGE_TAG}|g" ${GITOPS_DIR}/email-api-deployment.yaml
 
-        //                 git config user.email "omarhussein2111@gmail.com"
-        //                 git config user.name "Eng-Omar-Hussein"
-        //                 git remote set-url origin ${GITOPS_REPO}
-                        
-        //                 git add ${GITOPS_DIR}/email-api-deployment.yaml
-        //                 git commit -m "ci: bump ${APP_NAME} image to ${IMAGE_TAG}" || echo "No changes to commit"
-        //                 git push origin HEAD:main
-        //             """
-        //         }
-        //     }
-        // }
+        stage("Send Email") {
+            steps {
+                emailext(
+                    subject: "[CI Security] ${APP_NAME} build #${BUILD_NUMBER} - ${currentBuild.currentResult}",
+                    body: """
+                        Pipeline: ${JOB_NAME} #${BUILD_NUMBER}
+                        Image: ${DOCKERHUB_REPO}:${IMAGE_TAG}
+                        Status: ${currentBuild.currentResult}
+
+                        Reports: DefectDojo, Dependency-Track, and Jenkins artifacts.
+                        See: ${BUILD_URL}
+                        See also: ${DEFECTDOJO_URL}/engagement/${env.DD_ENGAGEMENT_ID}/
+                        See also: ${DTRACK_URL}/project/${DTRACK_PROJECT_ID}/
+                    """,
+                    to: "${EMAIL_RECIPIENTS}",
+                    attachmentsPattern: 'semgrep-report.json,bandit-report.json,gitleaks-report.json,trivy-*-report.json,zap-report.html,sbom.json'
+                )
+            }
+        }
     }
 
     post {
-        success {
-            emailext(
-                subject: "[CI Security] ${APP_NAME} build #${BUILD_NUMBER} - ${currentBuild.currentResult}",
-                body: """
-                    Pipeline: ${JOB_NAME} #${BUILD_NUMBER}
-                    Image: ${DOCKERHUB_REPO}:${IMAGE_TAG}
-                    Status: ${currentBuild.currentResult}
-
-                    Reports: DefectDojo, Dependency-Track, and Jenkins artifacts.
-                    See: ${BUILD_URL}
-                """,
-                to: "${EMAIL_RECIPIENTS}",
-                attachmentsPattern: 'semgrep-report.json,bandit-report.json,gitleaks-report.json,trivy-*-report.json,zap-report.html,sbom.json'
-            )
-        }
         always {
             sh 'docker logout || true'
             cleanWs()
