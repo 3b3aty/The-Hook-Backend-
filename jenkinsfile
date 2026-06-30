@@ -325,8 +325,6 @@ pipeline {
 
                         Reports: DefectDojo, Dependency-Track, and Jenkins artifacts.
                         See: ${BUILD_URL}
-                        See also: ${DEFECTDOJO_URL}/engagement/${env.DD_ENGAGEMENT_ID}/
-                        See also: ${DTRACK_URL}/project/${DTRACK_PROJECT_ID}/
                     """,
                     to: "${EMAIL_RECIPIENTS}",
                     attachmentsPattern: 'semgrep-report.json,bandit-report.json,gitleaks-report.json,trivy-*-report.json,zap-report.html,sbom.json'
