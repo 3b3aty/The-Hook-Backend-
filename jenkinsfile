@@ -44,7 +44,7 @@ pipeline {
             steps {
                 sh '''
                     pip install --upgrade pip
-                    apt-get update && apt-get install -y python3-venv
+                    apt install -y python3.10-venv || true
                     python3 -m venv venv
                     . venv/bin/activate
                     pip install -r requirements.txt
