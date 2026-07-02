@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Body, Request, Query, UploadFile
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Body, Request, Query
 from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import os
@@ -8,11 +8,10 @@ from contextlib import suppress
 import hashlib
 import html
 import json
-import mimetypes
 import re
 import shutil
 from datetime import datetime, timezone, timedelta
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime, make_msgid
 from email.message import EmailMessage
 from typing import Any, Dict, List, Optional, Union
 import requests
@@ -388,6 +387,9 @@ def extract_headers(headers: List[Dict[str, str]]) -> Dict[str, Optional[str]]:
 
     return {
         "raw_headers": "\n".join(raw_lines) if raw_lines else None,
+        "message_id": (header_map.get("message-id") or [None])[0],
+        "in_reply_to": (header_map.get("in-reply-to") or [None])[0],
+        "references": " ".join(header_map.get("references", [])) or None,
         "return_path": (header_map.get("return-path") or [None])[0],
         "received_chain": "\n".join(header_map.get("received", [])) or None,
         "spf_result": extract_auth_result("spf"),
@@ -716,6 +718,9 @@ def _create_email_from_gmail_message(
         models.EmailHeaders(
             email_id=email_record.id,
             return_path=header_info.get("return_path"),
+            message_id=header_info.get("message_id"),
+            in_reply_to=header_info.get("in_reply_to"),
+            references=header_info.get("references"),
             received_chain=header_info.get("received_chain"),
             spf_result=header_info.get("spf_result"),
             dkim_result=header_info.get("dkim_result"),
@@ -1312,6 +1317,10 @@ class SendEmailRequest(BaseModel):
         "draft",
         description='Email send state: "draft" or "sent"',
     )
+    reply_to_email_id: Optional[int] = Field(
+        None,
+        description="Optional email ID being replied to for thread reconstruction",
+    )
 
 
 class VerdictActionRequest(BaseModel):
@@ -1802,58 +1811,82 @@ def delete_label_rule(
     }
 
 
+def _build_reply_headers(original_message_id: Optional[str], existing_references: Optional[str]) -> Dict[str, Optional[str]]:
+    references_parts: List[str] = []
+    if existing_references:
+        references_parts.extend([part for part in existing_references.split() if part])
+    if original_message_id:
+        references_parts.append(original_message_id)
+    references_value = " ".join(dict.fromkeys(references_parts)) or None
+    return {
+        "In-Reply-To": original_message_id or None,
+        "References": references_value,
+    }
+
+
+def _get_or_create_conversation_interface(db: Session, sender_id: int, receiver_id: int, email_id: int) -> models.Interface:
+    existing = (
+        db.query(models.Interface)
+        .filter(
+            models.Interface.sender_id == sender_id,
+            models.Interface.receiver_id == receiver_id,
+        )
+        .order_by(models.Interface.id.desc())
+        .first()
+    )
+    if existing:
+        return existing
+
+    interface = models.Interface(sender_id=sender_id, receiver_id=receiver_id, email_id=email_id)
+    db.add(interface)
+    db.flush()
+    return interface
+
+
 @app.post("/emails/send", tags = ['emails'])
 async def send_email(
-    request: Request,
-    payload: Optional[SendEmailRequest] = Body(None),
+    payload: SendEmailRequest = Body(...),
     user: models.User = Depends(get_current_user_from_auth),
     db: Session = Depends(get_db),
 ):
-    content_type = (request.headers.get("content-type") or "").lower()
-    recipients_raw: Any = None
-    subject: Optional[str] = None
-    body: Optional[str] = None
-    delivery_status: str = "draft"
-
-    if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
-        form = await request.form()
-        recipients_raw = form.getlist("recipients") or form.getlist("to")
-        subject = form.get("subject")
-        body = form.get("body")
-        delivery_status = form.get("delivery_status") or "draft"
-    else:
-        if payload is None:
-            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
-        recipients_raw = payload.recipients
-        subject = payload.subject
-        body = payload.body
-        delivery_status = payload.delivery_status or "draft"
+    recipients_raw = payload.recipients
+    subject_value = payload.subject
+    body_value = payload.body
+    delivery_status_value = payload.delivery_status or "draft"
+    reply_to_value = payload.reply_to_email_id
+    reply_to_id = int(reply_to_value) if reply_to_value is not None else None
 
     recipients = _normalize_string_list(recipients_raw)
     if not recipients:
         raise HTTPException(
             status_code=400, detail="recipients must be a non-empty list of email addresses")
 
-    normalized_delivery_status = delivery_status.strip().lower()
+    normalized_delivery_status = delivery_status_value.strip().lower()
     if normalized_delivery_status not in {"sent", "draft"}:
         raise HTTPException(
             status_code=400, detail='delivery_status must be either "sent" or "draft"')
 
-    msg = EmailMessage()
-    msg["From"] = user.email
-    msg["To"] = ", ".join(recipients)
-    if subject:
-        msg["Subject"] = subject
-    msg.set_content(body or "")
+    original_email: Optional[models.Email] = None
+    reply_thread_id: Optional[str] = None
+    original_message_id: Optional[str] = None
+    existing_references: Optional[str] = None
+    if reply_to_id:
+        original_email = db.query(models.Email).filter(models.Email.id == reply_to_id).first()
+        if original_email:
+            reply_thread_id = original_email.thread_id
+            header_row = db.query(models.EmailHeaders).filter(models.EmailHeaders.email_id == original_email.id).first()
+            if header_row:
+                original_message_id = header_row.message_id or header_row.in_reply_to or original_email.gmail_message_id
+                existing_references = header_row.references or None
 
     category = _get_or_create_category(db, "Primary")
 
     email_record = models.Email(
         gmail_message_id=None,
-        thread_id=None,
-        subject=subject or "",
-        body_full=body or "",
-        body_snippet=(body or "")[:200],
+        thread_id=reply_thread_id,
+        subject=subject_value or "",
+        body_full=body_value or "",
+        body_snippet=(body_value or "")[:200],
         labels=None,
         date=datetime.now(timezone.utc),
         category_id=category.id,
@@ -1867,18 +1900,46 @@ async def send_email(
     db.add(email_record)
     db.flush()
 
+    reply_headers = _build_reply_headers(original_message_id, existing_references)
+    header_row = models.EmailHeaders(
+        email_id=email_record.id,
+        status="PENDING",
+        message_id=None,
+        in_reply_to=reply_headers.get("In-Reply-To"),
+        references=reply_headers.get("References"),
+    )
+    db.add(header_row)
+    db.flush()
+
+    reply_interface = None
+    if original_email and original_email.interface_id:
+        reply_interface = db.query(models.Interface).filter(models.Interface.id == original_email.interface_id).first()
+
     for r in recipients:
         r_user = db.query(models.User).filter(models.User.email == r).first()
         if not r_user:
             r_user = models.User(email=r, provider="external")
             db.add(r_user)
             db.flush()
-        db.add(models.Interface(sender_id=user.id,
-               receiver_id=r_user.id, email_id=email_record.id))
 
-    db.add(models.EmailHeaders(email_id=email_record.id, status="PENDING"))
+        if not reply_interface:
+            reply_interface = models.Interface(
+                sender_id=user.id,
+                receiver_id=r_user.id,
+                email_id=email_record.id,
+            )
+            db.add(reply_interface)
+            db.flush()
+        else:
+            db.add(models.Interface(
+                sender_id=user.id,
+                receiver_id=r_user.id,
+                email_id=email_record.id,
+            ))
+        email_record.interface_id = reply_interface.id
+        break
 
-    urls = extract_urls(body or "")
+    urls = extract_urls(body_value or "")
     for u in urls:
         db.add(models.UrlsExtracted(
             email_id=email_record.id, url=u, status="PENDING"))
@@ -1892,16 +1953,36 @@ async def send_email(
             "delivery_status": normalized_delivery_status,
         }
 
+    msg = EmailMessage()
+    msg["From"] = user.email
+    msg["To"] = ", ".join(recipients)
+    if subject_value:
+        msg["Subject"] = subject_value
+    if reply_headers.get("In-Reply-To"):
+        msg["In-Reply-To"] = reply_headers["In-Reply-To"]
+    if reply_headers.get("References"):
+        msg["References"] = reply_headers["References"]
+    msg.set_content(body_value or "")
+
+    message_id = make_msgid()
+    msg["Message-ID"] = message_id
+    header_row.message_id = message_id
+    db.add(header_row)
+
     raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     send_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
     access_token = _get_valid_google_access_token(user, db)
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    res = requests.post(send_url, headers=headers, json={"raw": raw_b64}, timeout=20)
+    request_payload: Dict[str, Any] = {"raw": raw_b64}
+    if reply_thread_id:
+        request_payload["threadId"] = reply_thread_id
+
+    res = requests.post(send_url, headers=headers, json=request_payload, timeout=20)
     if res.status_code in (401, 403):
         access_token = _refresh_google_access_token(user, db)
         headers = {"Authorization": f"Bearer {access_token}"}
-        res = requests.post(send_url, headers=headers, json={"raw": raw_b64}, timeout=20)
+        res = requests.post(send_url, headers=headers, json=request_payload, timeout=20)
 
     if not res.ok:
         error_detail = res.text
@@ -1909,16 +1990,17 @@ async def send_email(
             error_detail += " | RESOLUTION: Visit https://myaccount.google.com/permissions, revoke this app, then re-login via /auth/google/login"
         raise HTTPException(status_code=502, detail=f"Failed to send email: {error_detail}")
 
-    payload = res.json()
-    message_id = payload.get("id")
-    thread_id = payload.get("threadId")
-    if not message_id:
+    payload_response = res.json()
+    message_id_gmail = payload_response.get("id")
+    thread_id = payload_response.get("threadId") or reply_thread_id
+    if not message_id_gmail:
         raise HTTPException(status_code=502, detail="Gmail did not return message id")
 
-    existing = db.query(models.Email).filter(models.Email.gmail_message_id == message_id).first()
+    existing = db.query(models.Email).filter(models.Email.gmail_message_id == message_id_gmail).first()
     if existing:
         existing.delivery_status = normalized_delivery_status
         existing.is_read = True
+        existing.thread_id = thread_id or existing.thread_id
         existing_receivers = {
             iface.receiver.email for iface in existing.interfaces if iface.receiver}
         for r in recipients:
@@ -1931,19 +2013,61 @@ async def send_email(
                 db.add(models.Interface(sender_id=user.id,
                        receiver_id=r_user.id, email_id=existing.id))
         db.commit()
-        return {"email_id": existing.id, "gmail_message_id": message_id, "status": "exists_updated_receivers"}
+        return {"email_id": existing.id, "gmail_message_id": message_id_gmail, "status": "exists_updated_receivers"}
 
-    email_record.gmail_message_id = message_id
-    email_record.thread_id = thread_id
+    email_record.gmail_message_id = message_id_gmail
+    email_record.thread_id = thread_id or reply_thread_id
     email_record.delivery_status = normalized_delivery_status
     email_record.is_read = True
+    email_record.interface_id = email_record.interface_id
     db.commit()
 
     return {
         "email_id": email_record.id,
-        "gmail_message_id": message_id,
+        "gmail_message_id": message_id_gmail,
         "status": "sent",
         "delivery_status": normalized_delivery_status,
+    }
+
+
+@app.get("/emails/{email_id}", tags=['emails'])
+def get_email_thread(
+    email_id: int,
+    user: models.User = Depends(get_current_user_from_auth),
+    db: Session = Depends(get_db),
+):
+    selected = (
+        db.query(models.Email)
+        .join(models.Interface, models.Interface.email_id == models.Email.id)
+        .filter(
+            models.Email.id == email_id,
+            or_(
+                models.Interface.receiver_id == user.id,
+                models.Interface.sender_id == user.id,
+            ),
+        )
+        .first()
+    )
+    if not selected:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    thread_emails = (
+        db.query(models.Email)
+        .join(models.Interface, models.Interface.email_id == models.Email.id)
+        .filter(
+            models.Email.thread_id == selected.thread_id,
+            or_(
+                models.Interface.receiver_id == user.id,
+                models.Interface.sender_id == user.id,
+            ),
+        )
+        .order_by(models.Email.created_at.asc(), models.Email.id.asc())
+        .all()
+    )
+
+    return {
+        "email": _serialize_email_for_user(db, selected, user.id),
+        "thread": [_serialize_email_for_user(db, email, user.id) for email in thread_emails],
     }
 
 
@@ -2240,8 +2364,7 @@ def update_email_verdict(
 @app.patch("/emails/{email_id}/draft_edit", tags = ['emails'])
 async def draft_edit(
     email_id: int,
-    request: Request,
-    payload: Optional[SendEmailRequest] = Body(None),
+    payload: SendEmailRequest = Body(...),
     user: models.User = Depends(get_current_user_from_auth),
     db: Session = Depends(get_db),
 ):
@@ -2258,38 +2381,25 @@ async def draft_edit(
         raise HTTPException(
             status_code=400, detail="Only draft emails can be edited")
 
-    content_type = (request.headers.get("content-type") or "").lower()
-    recipients_raw: Any = None
-    subject: Optional[str] = None
-    body: Optional[str] = None
-    delivery_status: str = "draft"
-
-    if "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
-        form = await request.form()
-        recipients_raw = form.getlist("recipients") or form.getlist("to")
-        subject = form.get("subject")
-        body = form.get("body")
-        delivery_status = form.get("delivery_status") or "draft"
-    else:
-        if payload is None:
-            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
-        recipients_raw = payload.recipients
-        subject = payload.subject
-        body = payload.body
-        delivery_status = payload.delivery_status or "draft"
+    recipients_raw = payload.recipients
+    subject_value = payload.subject
+    body_value = payload.body
+    delivery_status_value = payload.delivery_status or "draft"
+    reply_to_value = payload.reply_to_email_id
+    reply_to_id = int(reply_to_value) if reply_to_value is not None else None
 
     recipients = _normalize_string_list(recipients_raw)
     if not recipients:
         raise HTTPException(
             status_code=400, detail="recipients must be a non-empty list of email addresses")
 
-    normalized_delivery_status = delivery_status.strip().lower()
+    normalized_delivery_status = delivery_status_value.strip().lower()
     if normalized_delivery_status not in {"sent", "draft"}:
         raise HTTPException(
             status_code=400, detail='delivery_status must be either "sent" or "draft"')
 
-    email.subject = subject or email.subject
-    email.body_full = body or email.body_full
+    email.subject = subject_value or email.subject
+    email.body_full = body_value or email.body_full
     email.body_snippet = (email.body_full or "")[:200]
     email.delivery_status = normalized_delivery_status
     email.status = "PENDING"
@@ -2328,8 +2438,11 @@ async def draft_edit(
             recipient_user = models.User(email=recipient_email, provider="external")
             db.add(recipient_user)
             db.flush()
-        db.add(models.Interface(sender_id=user.id,
-               receiver_id=recipient_user.id, email_id=email.id))
+        interface_row = models.Interface(sender_id=user.id,
+               receiver_id=recipient_user.id, email_id=email.id)
+        db.add(interface_row)
+        email.interface_id = interface_row.id
+        break
 
     if normalized_delivery_status == "draft":
         db.commit()
@@ -2342,12 +2455,23 @@ async def draft_edit(
             "recipients": recipients,
         }
 
-    msg = EmailMessage()
+    msg = MIMEMultipart("mixed")
     msg["From"] = user.email
     msg["To"] = ", ".join(recipients)
     if email.subject:
         msg["Subject"] = email.subject
-    msg.set_content(email.body_full or "")
+    body_part = MIMEText(email.body_full or "", "plain")
+    msg.attach(body_part)
+    for attachment in db.query(models.Attachments).filter(models.Attachments.email_id == email.id).all():
+        with open(attachment.file_url or "", "rb") as fh:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(fh.read())
+            encoders.encode_base64(part)
+            part.add_header(
+                "Content-Disposition",
+                f'attachment; filename="{attachment.file_name}"',
+            )
+            msg.attach(part)
 
     raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     send_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
