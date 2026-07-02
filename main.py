@@ -1879,6 +1879,15 @@ async def send_email(
                 original_message_id = header_row.message_id or header_row.in_reply_to or original_email.gmail_message_id
                 existing_references = header_row.references or None
 
+    # Force the reply subject to match the original conversation
+    if original_email:
+        original_subject = (original_email.subject or "").strip()
+
+        if original_subject.lower().startswith("re:"):
+            subject_value = original_subject
+        else:
+            subject_value = f"Re: {original_subject}"
+
     category = _get_or_create_category(db, "Primary")
 
     email_record = models.Email(
