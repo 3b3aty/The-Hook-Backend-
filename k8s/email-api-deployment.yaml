@@ -12,7 +12,7 @@ metadata:
   name: email-config
   namespace: email-api
 data:
-  GOOGLE_REDIRECT_URI: "http://ab9ed5250791c4b1c901cb21bb01d20d-1515650800.us-east-1.elb.amazonaws.com:8080/auth/google/callback"
+  GOOGLE_REDIRECT_URI: "https://redirectmeto.com/http://ab9ed5250791c4b1c901cb21bb01d20d-1515650800.us-east-1.elb.amazonaws.com:8080/auth/google/callback"
   # Database
   DATABASE_URL: "sqlite:///./test.db"
   
