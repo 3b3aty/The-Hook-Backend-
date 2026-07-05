@@ -189,7 +189,7 @@ pipeline {
         stage('DAST - OWASP ZAP') {
             steps {
                 sh '''
-                    docker run --rm --network host -v "$PWD":/zap/wrk/:rw \
+                    docker run --rm --user root --network host -v "$PWD":/zap/wrk/:rw \
                         zaproxy/zap-stable zap-baseline.py \
                         -t ${ZAP_TARGET_URL} \
                         -J zap-report.json -r zap-report.html || true
