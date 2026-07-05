@@ -76,6 +76,7 @@ class Email(Base):
     delivery_status = Column(String, default="draft")
 
     category_id = Column(Integer, ForeignKey('categories.id'), nullable=True)
+    interface_id = Column(Integer, ForeignKey('interfaces.id'), nullable=True, index=True)
 
     # GLOBAL STATUS
     # PENDING, PROCESSING, ANALYZED, FAILED
@@ -109,7 +110,11 @@ class Email(Base):
 
     # RELATIONSHIPS
     category = relationship("Category", back_populates="emails")
-    interfaces = relationship("Interface", back_populates="email")
+    interfaces = relationship(
+        "Interface",
+        back_populates="email",
+        foreign_keys="[Interface.email_id]",
+    )
     deadlines = relationship("EmailDeadline", back_populates="email")
 
     headers = relationship(
@@ -189,7 +194,11 @@ class Interface(Base):
     receiver_id = Column(Integer, ForeignKey('users.id'))
     email_id = Column(Integer, ForeignKey('emails.id'))
 
-    email = relationship("Email", back_populates="interfaces")
+    email = relationship(
+        "Email",
+        back_populates="interfaces",
+        foreign_keys="[Interface.email_id]",
+    )
     sender = relationship(
         "User", back_populates="interface_sender", foreign_keys=[sender_id])
     receiver = relationship(
@@ -210,6 +219,9 @@ class EmailHeaders(Base):
     verdict = Column(String, nullable=True)
     score = Column(Float, nullable=True)
 
+    message_id = Column(String, nullable=True)
+    in_reply_to = Column(String, nullable=True)
+    references = Column(Text, nullable=True)
     raw_headers = Column(Text, nullable=True)
 
     received_chain = Column(String, nullable=True)
