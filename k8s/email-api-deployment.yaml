@@ -126,7 +126,7 @@ spec:
     spec:
       containers:
       - name: email-api
-        image: omarhussein2111/email-api:2-fee1cd9
+        image: omarhussein2111/email-api:3-5066f77
         ports:
         - containerPort: 8000
         envFrom:
@@ -168,7 +168,7 @@ spec:
     spec:
       containers:
       - name: email-worker
-        image: omarhussein2111/email-api:2-fee1cd9
+        image: omarhussein2111/email-api:3-5066f77
         command: ["celery"]
         args: ["-A", "celery_app", "worker", "--loglevel=info"]
         envFrom:
