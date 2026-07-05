@@ -6,8 +6,8 @@ pipeline {
         DOCKERHUB_REPO     = "omarhussein2111/email-api"
         GITOPS_REPO        = "git@github.com:Eng-Omar-Hussein/The-Hook-Backend.git"
         GITOPS_DIR         = "k8s"
-        DEFECTDOJO_URL     = "http://32.199.177.221:8080"
-        DTRACK_URL         = "http://32.199.177.221:8081"
+        DEFECTDOJO_URL     = "http://13.221.19.95:8080"
+        DTRACK_URL         = "http://13.221.19.95:8081"
         DTRACK_PROJECT_ID  = credentials('dtrack-project-id')
         DOCKERHUB_CREDS    = credentials('dockerhub-creds')
         DEFECTDOJO_TOKEN   = credentials('defectdojo-api-token')
