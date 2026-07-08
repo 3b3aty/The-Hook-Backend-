@@ -1,0 +1,349 @@
+pipeline {
+    agent any
+
+    environment {
+        APP_NAME           = "email-api"
+        DOCKERHUB_REPO     = "omarhussein2111/email-api"
+        GITOPS_REPO        = "git@github.com:Eng-Omar-Hussein/The-Hook-Backend.git"
+        GITOPS_DIR         = "k8s"
+        DEFECTDOJO_URL     = "http://13.221.19.95:8080"
+        DTRACK_URL         = "http://13.221.19.95:8081"
+        DTRACK_PROJECT_ID  = credentials('dtrack-project-id')
+        DOCKERHUB_CREDS    = credentials('dockerhub-creds')
+        DEFECTDOJO_TOKEN   = credentials('defectdojo-api-token')
+        DTRACK_API_KEY     = credentials('dtrack-api-key')
+        EMAIL_RECIPIENTS   = "ahmedabokheira@gmail.com"
+        ZAP_TARGET_URL     = "http://localhost:8089"
+    }
+
+    options {
+        // timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 45, unit: 'MINUTES')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh "docker build -t ${DOCKERHUB_REPO}:${IMAGE_TAG} -t ${DOCKERHUB_REPO}:latest ."
+            }
+        }
+
+        stage('Install Deps') {
+            steps {
+                sh '''
+                    pip install --upgrade pip
+                    apt install -y python3.10-venv || true
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install -r requirements.txt
+                '''
+            }
+        }
+
+        stage('SAST - Semgrep') {
+            steps {
+                sh '''
+                    pip install semgrep  || true
+                    semgrep --config=p/owasp-top-ten --config=p/security-audit \
+                        --json --output=semgrep-report.json . || true
+                '''
+            }
+            post {
+                always { archiveArtifacts artifacts: 'semgrep-report.json', allowEmptyArchive: true }
+            }
+        }
+
+        stage('SAST - Bandit') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    pip install bandit
+                    bandit -r . -f json -o bandit-report.json -ll || true
+                '''
+            }
+            post {
+                always { archiveArtifacts artifacts: 'bandit-report.json', allowEmptyArchive: true }
+            }
+        }
+
+        stage('Secrets Scan - Gitleaks') {
+            steps {
+                sh '''
+                    docker run --rm -v "$PWD":/repo zricethezav/gitleaks:latest \
+                        detect --source=/repo --report-format=json \
+                        --report-path=/repo/gitleaks-report.json --no-git || true
+                '''
+            }
+            post {
+                always { archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true }
+            }
+        }
+
+        stage('Gate: Critical Secrets Found?') {
+            steps {
+                script {
+                    def leaks = readJSON file: 'gitleaks-report.json' ?: '[]'
+                    if (leaks && leaks.size() > 0) {
+                        echo "WARNING: ${leaks.size()} potential secrets found. Review report."
+                        // Uncomment to hard-fail the build:
+                        // error("Secrets detected - failing pipeline")
+                    }
+                }
+            }
+        }
+
+        stage('SBOM - CycloneDX') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    pip install cyclonedx-bom
+                    cyclonedx-py environment -o sbom.json --output-format json
+                '''
+            }
+            post {
+                always { archiveArtifacts artifacts: 'sbom.json', allowEmptyArchive: true }
+            }
+        }
+
+        stage('Push Image to DockerHub') {
+            steps {
+                sh '''
+                    echo "$DOCKERHUB_CREDS_PSW" | docker login -u "$DOCKERHUB_CREDS_USR" --password-stdin
+                    docker push ${DOCKERHUB_REPO}:${IMAGE_TAG}
+                    docker push ${DOCKERHUB_REPO}:latest
+                '''
+            }
+        }
+        
+        stage('Scan - Trivy (Image + FS + SBOM)') {
+            steps {
+                sh '''
+                    mkdir -p .trivy-cache
+
+                    # Show Trivy version
+                    docker run --rm \
+                        -v "$PWD":/repo \
+                        -v "$PWD/.trivy-cache:/root/.cache/trivy" \
+                        aquasec/trivy:latest --version
+
+                    # Filesystem Scan
+                    docker run --rm \
+                        -v "$PWD":/repo \
+                        -v "$PWD/.trivy-cache:/root/.cache/trivy" \
+                        aquasec/trivy:latest \
+                        fs \
+                        --format json \
+                        --output /repo/trivy-fs-report.json \
+                        /repo || true
+
+                    # Docker Image Scan
+                    docker run --rm \
+                        -v "$PWD":/repo \
+                        -v "$PWD/.trivy-cache:/root/.cache/trivy" \
+                        aquasec/trivy:latest \
+                        image \
+                        --format json \
+                        --output /repo/trivy-image-report.json \
+                        ${DOCKERHUB_REPO}:${IMAGE_TAG} || true
+                '''
+            }
+
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-*-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+
+        stage('Deploy to Staging (for DAST)') {
+            steps {
+                sh '''
+                    docker rm -f fastapi02-staging || true
+                    docker run -d --name fastapi02-staging -p 8089:8000 ${DOCKERHUB_REPO}:${IMAGE_TAG}
+
+                    for i in $(seq 1 20); do
+                        if curl -sf http://localhost:8089/docs > /dev/null 2>&1; then
+                            echo "App is ready"
+                            break
+                        fi
+                        echo "Waiting for app... ($i/20)"
+                        sleep 3
+                    done
+                '''
+            }
+        }
+
+        stage('DAST - OWASP ZAP') {
+            steps {
+                sh '''
+                    docker run --rm --user root --network host -v "$PWD":/zap/wrk/:rw \
+                        zaproxy/zap-stable zap-baseline.py \
+                        -t ${ZAP_TARGET_URL} \
+                        -J zap-report.json -r zap-report.html || true
+                '''
+            }
+            post {
+                always {
+                    sh 'docker rm -f fastapi02-staging || true'
+                    archiveArtifacts artifacts: 'zap-report.*', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Ensure DefectDojo Product/Engagement') {
+            steps {
+                script {
+                    // Check if product exists, else create it
+                    def productSearch = sh(
+                        script: """
+                            curl -s -H "Authorization: Token ${DEFECTDOJO_TOKEN}" \
+                            "${DEFECTDOJO_URL}/api/v2/products/?name=${APP_NAME}"
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    def productJson = readJSON text: productSearch
+                    def productId
+
+                    if (productJson.count == 0) {
+                        def createProduct = sh(
+                            script: """
+                                curl -s -X POST "${DEFECTDOJO_URL}/api/v2/products/" \
+                                -H "Authorization: Token ${DEFECTDOJO_TOKEN}" \
+                                -H "Content-Type: application/json" \
+                                -d '{"name": "${APP_NAME}", "description": "CI pipeline product", "prod_type": 1}'
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        productId = readJSON(text: createProduct).id
+                    } else {
+                        productId = productJson.results[0].id
+                    }
+
+                    // Check if engagement exists for this build, else create it
+                    def createEngagement = sh(
+                        script: """
+                            curl -s -X POST "${DEFECTDOJO_URL}/api/v2/engagements/" \
+                            -H "Authorization: Token ${DEFECTDOJO_TOKEN}" \
+                            -H "Content-Type: application/json" \
+                            -d '{"name": "Build-${BUILD_NUMBER}", "product": ${productId}, "target_start": "${new Date().format('yyyy-MM-dd')}", "target_end": "${new Date().format('yyyy-MM-dd')}", "status": "In Progress"}'
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    env.DD_ENGAGEMENT_ID = readJSON(text: createEngagement).id
+                }
+            }
+        }
+
+        stage('Upload Reports to DefectDojo') {
+            steps {
+                script {
+                    def reports = [
+                        [file: 'semgrep-report.json', type: 'Semgrep JSON Report'],
+                        [file: 'bandit-report.json',  type: 'Bandit Scan'],
+                        [file: 'gitleaks-report.json',type: 'Gitleaks Scan'],
+                        [file: 'trivy-image-report.json', type: 'Trivy Scan'],
+                        [file: 'trivy-fs-report.json', type: 'Trivy Scan'],
+                        [file: 'zap-report.json', type: 'ZAP Scan']
+                    ]
+                    reports.each { r ->
+                        sh """
+                            curl -s -X POST ${DEFECTDOJO_URL}/api/v2/import-scan/ \
+                            -H "Authorization: Token ${DEFECTDOJO_TOKEN}" \
+                            -F "scan_type=${r.type}" \
+                            -F "file=@${r.file}" \
+                            -F "engagement=${env.DD_ENGAGEMENT_ID}" \
+                            -F "active=true" \
+                            -F "verified=false" || true
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Upload SBOM to Dependency-Track') {
+            steps {
+                sh """
+                    curl -s -X POST "${DTRACK_URL}/api/v1/bom" \
+                    -H "X-Api-Key: ${DTRACK_API_KEY}" \
+                    -F "project=${DTRACK_PROJECT_ID}" \
+                    -F "bom=@sbom.json" || true
+                """
+            }
+        }
+
+        stage('Update Manifest & Push to GitHub') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'github-creds',
+                    usernameVariable: 'GITHUB_USER',
+                    passwordVariable: 'GITHUB_TOKEN'
+                )]) {
+                    sh '''
+                        sed -i -E "s|(^[[:space:]]*image: )omarhussein2111/.*|\\1${DOCKERHUB_REPO}:${IMAGE_TAG}|g" k8s/email-api-deployment.yaml
+
+                        git config user.email "omarhussein2111@gmail.com"
+                        git config user.name "Eng-Omar-Hussein"
+
+                        git add k8s/email-api-deployment.yaml
+
+                        if git diff --cached --quiet; then
+                            echo "No changes to commit."
+                            exit 0
+                        fi
+
+                        git commit -m "ci: bump email-api image to ${IMAGE_TAG}"
+
+                        git remote set-url origin https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/Eng-Omar-Hussein/The-Hook-Backend.git
+
+                        git push origin HEAD:main
+                    '''
+                }
+            }
+        }
+
+        stage("Send Email") {
+            steps {
+                emailext(
+                    subject: "[CI Security] ${APP_NAME} build #${BUILD_NUMBER} - ${currentBuild.currentResult}",
+                    body: """
+                        Pipeline: ${JOB_NAME} #${BUILD_NUMBER}
+                        Image: ${DOCKERHUB_REPO}:${IMAGE_TAG}
+                        Status: ${currentBuild.currentResult}
+
+                        Reports: DefectDojo, Dependency-Track, and Jenkins artifacts.
+                        See: ${BUILD_URL}
+                    """,
+                    to: "${EMAIL_RECIPIENTS}",
+                    attachmentsPattern: 'semgrep-report.json,bandit-report.json,gitleaks-report.json,trivy-*-report.json,zap-report.html,sbom.json'
+                )
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'docker logout || true'
+            cleanWs()
+        }
+        failure {
+            emailext(
+                subject: "[CI FAILED] ${APP_NAME} build #${BUILD_NUMBER}",
+                body: "Pipeline failed. Check: ${BUILD_URL}",
+                to: "${EMAIL_RECIPIENTS}"
+            )
+        }
+    }
+}
